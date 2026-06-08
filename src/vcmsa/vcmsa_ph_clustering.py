@@ -132,11 +132,28 @@ def convert_ph_clusters_to_vcmsa_format(cluster_labels, seqs, seq_names, hidden_
 def build_cluster_hidden_states_for_vcmsa(cluster_seqnums_list, hidden_states_list):
     cluster_hstates_list = []
     for indices in cluster_seqnums_list:
-        cluster_hidden_states = [hidden_states_list[i] for i in indices]
-        max_len = max((h.shape[0] for h in cluster_hidden_states), default=0)
-        emb_dim = cluster_hidden_states[0].shape[1] if cluster_hidden_states and cluster_hidden_states[0].ndim == 2 else 0
+        cluster_hidden_states = []
+        for i in indices:
+            hs = hidden_states_list[i]
+            if hs is None:
+                hs = np.zeros((0, 0))
+            cluster_hidden_states.append(hs)
+
+        max_len = max([h.shape[0] for h in cluster_hidden_states]) if cluster_hidden_states else 0
+        emb_dim = 0
+        for hs in cluster_hidden_states:
+            if hs is not None and hs.ndim == 2:
+                emb_dim = hs.shape[1]
+                break
+        if cluster_hidden_states and emb_dim == 0:
+            raise ValueError(
+                "Unable to determine embedding dimension for cluster indices {}: "
+                "all hidden states are None or not 2D arrays".format(indices)
+            )
         padded = []
         for hs in cluster_hidden_states:
+            if hs.ndim != 2:
+                hs = np.zeros((0, emb_dim))
             pad_rows = max_len - hs.shape[0]
             if pad_rows > 0:
                 hs = np.pad(hs, ((0, pad_rows), (0, 0)))

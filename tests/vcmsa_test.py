@@ -63,6 +63,10 @@ class test_vcmsa(unittest.TestCase):
         pairs = identify_rbh_in_clusters(labels, hidden_states, seq_names=["a", "b", "c"], threshold=0.8)
         pair_names = {(x[0], x[1]) for x in pairs}
         self.assertIn(("a", "b"), pair_names)
+        self.assertNotIn(("a", "c"), pair_names)
+        self.assertNotIn(("b", "c"), pair_names)
+        pair_scores = { (x[0], x[1]): x[2] for x in pairs }
+        self.assertGreaterEqual(pair_scores[("a", "b")], 0.8)
 
     #def test1(self):
     #    '''
