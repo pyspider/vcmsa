@@ -82,8 +82,18 @@ def get_align_args():
 
     parser.add_argument('--log', dest = "loglevel",  choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], default='INFO')
 
-    parser.add_argument("-m", "--model", dest = "model_name",  type = str, required = True,
+    parser.add_argument("-m", "--model", dest = "model_name",  type = str, required = False,
                         help="Model name or path to local model")
+    parser.add_argument("--use_ph_clustering", dest="use_ph_clustering", action="store_true",
+                        help="Use persistent homology clustering to replace vcMSA sequence grouping")
+    parser.add_argument("--esm_model", dest="esm_model", type=str, default="facebook/esm2_t33_650M_UR50D",
+                        help="ESM-2 model identifier for PH clustering")
+    parser.add_argument("--ph_eps", dest="ph_eps", type=float, default=0.5,
+                        help="DBSCAN eps for PH clustering, default = 0.5")
+    parser.add_argument("--ph_min_samples", dest="ph_min_samples", type=int, default=2,
+                        help="DBSCAN min_samples for PH clustering, default = 2")
+    parser.add_argument("--ph_layer", dest="ph_layer", type=int, default=-1,
+                        help="ESM hidden-state layer for PH clustering, default = -1 (last layer)")
 
     parser.add_argument("-co", "--cpu_only", dest = "cpu_only",  action = "store_true",
                         help="If --cpu_only flag is included, will run on cpu even if gpu available")
@@ -135,6 +145,8 @@ def get_align_args():
     parser.add_argument("-dc", "--do_clustering", dest = "do_clustering", action='store_true',
                         help="If flagged, does sequence clustering into subgroups")
     args = parser.parse_args()
+    if not args.use_ph_clustering and args.model_name is None:
+        parser.error("argument -m/--model is required unless --use_ph_clustering is set")
 
     return(args)
 
@@ -840,6 +852,11 @@ if __name__ == '__main__':
     headnorm = args.headnorm
     padding =args.padding
     seqsim_thresh  = args.seqsimthresh 
+    use_ph_clustering = args.use_ph_clustering
+    esm_model = args.esm_model
+    ph_eps = args.ph_eps
+    ph_min_samples = args.ph_min_samples
+    ph_layer = args.ph_layer
     do_clustering = args.do_clustering
     do_clustering = True
 
@@ -895,6 +912,7 @@ if __name__ == '__main__':
     minscore1 = 0.5
 
     logging.debug("model: {}".format(model_name))
+    logging.debug("use_ph_clustering: {}".format(use_ph_clustering))
     logging.debug("fasta: {}".format(fasta_path))
     logging.debug("padding: {}".format(padding))
     logging.debug("first score thresholds: {}".format(minscore1))
@@ -908,44 +926,89 @@ if __name__ == '__main__':
 
  
 
-    # The first step is to get embeddings
-    if embedding_path:
-       with open(embedding_path, "rb") as f:
-             embedding_dict = pickle.load(f)
+    if use_ph_clustering:
+        from vcmsa.vcmsa_ph_clustering import (
+            get_esm2_hidden_states,
+            compute_persistent_homology,
+            compute_wasserstein_distance_matrix,
+            cluster_by_persistent_homology,
+            identify_rbh_in_clusters,
+            convert_ph_clusters_to_vcmsa_format,
+            build_cluster_hidden_states_for_vcmsa,
+        )
 
+        hidden_states_list = []
+        persistent_diagrams = []
+        ph_device = torch.device("cuda" if torch.cuda.is_available() and not cpu_only else "cpu")
+
+        for seq in seqs:
+            hidden_states = get_esm2_hidden_states(
+                seq,
+                model_name=esm_model,
+                layer=ph_layer,
+                device=ph_device,
+            )
+            hidden_states_list.append(hidden_states)
+            persistent_diagrams.append(compute_persistent_homology(hidden_states))
+
+        wasserstein_matrix = compute_wasserstein_distance_matrix(persistent_diagrams)
+        cluster_labels, _ = cluster_by_persistent_homology(
+            wasserstein_matrix,
+            eps=ph_eps,
+            min_samples=ph_min_samples,
+        )
+
+        cluster_seqnums_list, cluster_seqs_list, cluster_names_list = \
+            convert_ph_clusters_to_vcmsa_format(cluster_labels, seqs, seq_names, hidden_states_list)
+        cluster_hstates_list = build_cluster_hidden_states_for_vcmsa(cluster_seqnums_list, hidden_states_list)
+        to_exclude = []
+
+        rbh_pairs = identify_rbh_in_clusters(
+            cluster_labels,
+            hidden_states_list,
+            seq_names=seq_names,
+        )
+        logging.info("PH clustering generated %s clusters and %s RBH pairs",
+                     len(cluster_seqnums_list), len(rbh_pairs))
     else:
-        seqlens = [len(x) for x in seqs]
-       #print("printing model_name:")
-       #print(model_name)
-       #print("printing seq_lens")
-       #print(seqlens)
-       #print("printing layers")
-       #print(layers)
-       #print("printing padding")
-       #print(padding)
-        #print("printing headnames")
-        #print(headnames)
-        embedding_dict = get_embeddings(seqs_spaced,
-                                    model_name,
-                                    seqlens = seqlens,
-                                    get_sequence_embeddings = True,
-                                    get_aa_embeddings = True,
-                                    layers = layers,  
-                                    padding = padding,
-                                    heads = headnames,
-                                    cpu_only = cpu_only, 
-                                    half = False)
-        if emb_outfile:
-           with open(emb_outfile, "wb") as fOut:
-               pickle.dump(embedding_dict, fOut, protocol=pickle.HIGHEST_PROTOCOL)
+        # The first step is to get embeddings
+        if embedding_path:
+           with open(embedding_path, "rb") as f:
+                 embedding_dict = pickle.load(f)
 
-        if embed_only:
-            #print("Quiting after saving embedding at {}".format(emb_outfile))
-            exit(0)
+        else:
+            seqlens = [len(x) for x in seqs]
+           #print("printing model_name:")
+           #print(model_name)
+           #print("printing seq_lens")
+           #print(seqlens)
+           #print("printing layers")
+           #print(layers)
+           #print("printing padding")
+           #print(padding)
+            #print("printing headnames")
+            #print(headnames)
+            embedding_dict = get_embeddings(seqs_spaced,
+                                        model_name,
+                                        seqlens = seqlens,
+                                        get_sequence_embeddings = True,
+                                        get_aa_embeddings = True,
+                                        layers = layers,  
+                                        padding = padding,
+                                        heads = headnames,
+                                        cpu_only = cpu_only, 
+                                        half = False)
+            if emb_outfile:
+               with open(emb_outfile, "wb") as fOut:
+                   pickle.dump(embedding_dict, fOut, protocol=pickle.HIGHEST_PROTOCOL)
 
-    # The sequences are divided into groups
-    #ic(seqsim_thresh)
-    cluster_seqnums_list, cluster_seqs_list,  cluster_names_list, cluster_hstates_list, to_exclude = get_seq_groups(seqs ,seq_names, embedding_dict,  exclude, do_clustering, outfile_name, record_dir, seqsim_thresh = seqsim_thresh, pca_plot = pca_plot )
+            if embed_only:
+                #print("Quiting after saving embedding at {}".format(emb_outfile))
+                exit(0)
+
+        # The sequences are divided into groups
+        #ic(seqsim_thresh)
+        cluster_seqnums_list, cluster_seqs_list,  cluster_names_list, cluster_hstates_list, to_exclude = get_seq_groups(seqs ,seq_names, embedding_dict,  exclude, do_clustering, outfile_name, record_dir, seqsim_thresh = seqsim_thresh, pca_plot = pca_plot )
 
     aln_fasta_list = []
     excluded_records = []

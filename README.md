@@ -133,8 +133,12 @@ suffix=.16layer.t5.aln
 vcmsa  -i $fasta -o $fasta.$suffix --layers  $layers  -m $model --exclude --pca_plot
 
 
-```
+# Persistent homology clustering (ESM-2 + Gudhi)
+vcmsa -i $fasta -o $fasta.ph.aln --use_ph_clustering \
+      --esm_model facebook/esm2_t33_650M_UR50D \
+      --ph_eps 0.5 --ph_min_samples 2 --ph_layer -1
 
+```
 
 
 
