@@ -1,0 +1,9 @@
+Metadata-Version: 2.1
+Name: vcmsa
+Version: 0.1.0
+Summary: Python library to perform vcmsa
+Home-page: http://github.com/clairemcwhite/vcmsa
+Author: Claire D. McWhite
+Author-email: cmcwhite@princeton.edu
+License: MIT
+License-File: LICENSE
