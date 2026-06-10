@@ -5,6 +5,9 @@ import unittest
 try:
     import numpy as np
     from vcmsa.vcmsa_ph_clustering import (
+        _safe_diagram,
+        compute_persistent_homology,
+        compute_wasserstein_distance_matrix,
         cluster_by_persistent_homology,
         convert_ph_clusters_to_vcmsa_format,
         build_cluster_hidden_states_for_vcmsa,
@@ -23,6 +26,78 @@ class test_vcmsa(unittest.TestCase):
         Fake test
         '''    
         self.assertTrue(True == True)
+
+    @unittest.skipUnless(HAS_PH_DEPS, "PH test dependencies are not installed")
+    def test_safe_diagram_edge_cases(self):
+        """Test _safe_diagram handles various inputs correctly."""
+        # None input
+        result = _safe_diagram(None)
+        self.assertEqual(result.shape, (0, 2))
+
+        # Empty array
+        result = _safe_diagram(np.array([]))
+        self.assertEqual(result.shape, (0, 2))
+
+        # 1D input reshaped to Nx2
+        result = _safe_diagram(np.array([1.0, 2.0, 3.0, 4.0]))
+        self.assertEqual(result.shape, (2, 2))
+
+        # Filters infinite values
+        arr = np.array([[1.0, 2.0], [3.0, np.inf], [4.0, 5.0]])
+        result = _safe_diagram(arr)
+        self.assertEqual(result.shape, (2, 2))
+
+    @unittest.skipUnless(HAS_PH_DEPS, "PH test dependencies are not installed")
+    def test_compute_persistent_homology_returns_dict(self):
+        """Test that compute_persistent_homology returns multi-dimensional diagrams."""
+        hidden_states = np.random.rand(10, 5)
+        result = compute_persistent_homology(hidden_states, dimensions=[0, 1])
+        self.assertIsInstance(result, dict)
+        self.assertIn(0, result)
+        self.assertIn(1, result)
+        self.assertEqual(result[0].ndim, 2)
+        self.assertEqual(result[0].shape[1], 2)
+
+    @unittest.skipUnless(HAS_PH_DEPS, "PH test dependencies are not installed")
+    def test_compute_persistent_homology_empty_input(self):
+        """Test PH with empty/singleton inputs."""
+        # Empty
+        result = compute_persistent_homology(np.array([]), dimensions=[0])
+        self.assertEqual(result[0].shape, (0, 2))
+
+        # Single residue
+        result = compute_persistent_homology(np.array([[1.0, 2.0]]), dimensions=[0])
+        self.assertEqual(result[0].shape[0], 1)
+
+    @unittest.skipUnless(HAS_PH_DEPS, "PH test dependencies are not installed")
+    def test_wasserstein_distance_matrix_multidim(self):
+        """Test Wasserstein distance with multi-dimensional diagrams."""
+        diagrams = [
+            {0: np.array([[0.0, 1.0], [0.5, 2.0]]), 1: np.array([[0.1, 0.5]])},
+            {0: np.array([[0.0, 1.0], [0.5, 2.0]]), 1: np.array([[0.1, 0.5]])},
+            {0: np.array([[0.0, 5.0], [1.0, 3.0]]), 1: np.array([[0.0, 2.0]])},
+        ]
+        matrix = compute_wasserstein_distance_matrix(diagrams, dimensions=[0, 1])
+        self.assertEqual(matrix.shape, (3, 3))
+        # Identical diagrams should have zero distance
+        self.assertAlmostEqual(matrix[0, 1], 0.0, places=5)
+        # Different diagrams should have non-zero distance
+        self.assertGreater(matrix[0, 2], 0.0)
+        # Symmetric
+        self.assertAlmostEqual(matrix[0, 2], matrix[2, 0], places=5)
+
+    @unittest.skipUnless(HAS_PH_DEPS, "PH test dependencies are not installed")
+    def test_wasserstein_distance_matrix_legacy_format(self):
+        """Test Wasserstein distance with legacy ndarray format."""
+        diagrams = [
+            np.array([[0.0, 1.0], [0.5, 2.0]]),
+            np.array([[0.0, 1.0], [0.5, 2.0]]),
+            np.array([[0.0, 5.0], [1.0, 3.0]]),
+        ]
+        matrix = compute_wasserstein_distance_matrix(diagrams)
+        self.assertEqual(matrix.shape, (3, 3))
+        self.assertAlmostEqual(matrix[0, 1], 0.0, places=5)
+        self.assertGreater(matrix[0, 2], 0.0)
 
     @unittest.skipUnless(HAS_PH_DEPS, "PH test dependencies are not installed")
     def test_ph_cluster_and_convert_format(self):
@@ -68,101 +143,45 @@ class test_vcmsa(unittest.TestCase):
         pair_scores = { (x[0], x[1]): x[2] for x in pairs }
         self.assertGreaterEqual(pair_scores[("a", "b")], 0.8)
 
-    #def test1(self):
-    #    '''
-    #    Test of summary
-    #    '''
-    #    pp = vcmsa.PassageParser()
-    #    p = pp.parse_passage("E1_E3")
-    #    self.assertTrue(p.summary, list)
-    #
-    #def test2(self):
-    #    '''
-    #    Test example case
-    #    '''
+    @unittest.skipUnless(HAS_PH_DEPS, "PH test dependencies are not installed")
+    def test_full_ph_pipeline_integration(self):
+        """Integration test: full PH pipeline with synthetic data."""
+        # Generate two groups of "sequences" with distinct hidden states
+        np.random.seed(42)
+        # Group 1: similar hidden states (clustered around [1, 0])
+        hs_group1 = [np.random.normal(loc=[1, 0], scale=0.1, size=(5, 2)) for _ in range(3)]
+        # Group 2: similar hidden states (clustered around [0, 1])
+        hs_group2 = [np.random.normal(loc=[0, 1], scale=0.1, size=(5, 2)) for _ in range(3)]
+        all_hs = hs_group1 + hs_group2
 
-    #    pp = vcmsa.PassageParser()
-    #    p = pp.parse_passage("Mdcksiat2_E3", 3)
-    #    #print(vars(p))
-    #    self.assertTrue(p.original == "Mdcksiat2_E3")
-    #    self.assertTrue(p.plain_format == "MDCKSIAT2_E3")
-    #    self.assertTrue(p.coerced_format == "S2_E3")
-    #    self.assertTrue(p.ordered_passages) == ['MDCKSIAT2', 'E3']
-    #    self.assertTrue(p.min_passages == 5)
-    #    self.assertTrue(p.total_passages == 5)
-    #    self.assertTrue(p.nth_passage == 'EGG')
-    #    self.assertTrue(p.general_passages== ["CANINECELL", "EGG"])
-    #    self.assertTrue(p.specific_passages == ["SIAT", "EGG"])
-    #    self.assertTrue(p.passage_series == [[1, 'SIAT'], [2, 'SIAT'], [3, 'EGG'], [4, 'EGG'], [5, 'EGG']]) 
-    #    self.assertTrue(p.summary == ['Mdcksiat2_E3', 'MDCKSIAT2_E3', 'S2_E3', 'CANINECELL+EGG', 'SIAT+EGG', 'exactly', '5'])
-    #         
+        # Compute PH for each
+        diagrams = [compute_persistent_homology(hs, dimensions=[0]) for hs in all_hs]
 
-    #def test3(self):
-    #    '''
-    #    Test an empty passage annotation
-    #    '''
-    #    pp = vcmsa.PassageParser()
-    #    p = pp.parse_passage("")
-    #    self.assertTrue(p.original == "")
-    #    self.assertTrue(p.plain_format == "")
-    #    self.assertTrue(p.coerced_format == "")
-    #    self.assertTrue(p.summary == ['','','','','','',''])
+        # Compute Wasserstein matrix
+        matrix = compute_wasserstein_distance_matrix(diagrams, dimensions=[0])
+        self.assertEqual(matrix.shape, (6, 6))
 
-    #    self.assertTrue(p.min_passages == "")
-    #    self.assertTrue(p.total_passages == "")
-    #    self.assertTrue(p.nth_passage == "")
-    #    self.assertTrue(p.general_passages== [])
-    #    self.assertTrue(p.specific_passages == [])
-    #    self.assertTrue(p.passage_series == []) 
-    #         
+        # Cluster - with appropriate eps for this synthetic data
+        labels, clusters = cluster_by_persistent_homology(matrix, eps=1.0, min_samples=2)
 
+        # Should find at least some clustering structure
+        n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+        self.assertGreaterEqual(n_clusters, 1)
 
-    #def test4(self):
-    #    '''
-    #    Check a a longer list of passage IDs
-    #    and write an outfile of the summary test
-    #    These passage IDs are already partially formatted
-    #    '''        
+    @unittest.skipUnless(HAS_PH_DEPS, "PH test dependencies are not installed")
+    def test_convert_format_all_noise(self):
+        """Test conversion when all points are noise (label=-1)."""
+        labels = np.array([-1, -1, -1])
+        seqs = ["AA", "BB", "CC"]
+        names = ["s1", "s2", "s3"]
+        hs = [np.array([[1.0, 0.0]]), np.array([[0.0, 1.0]]), np.array([[0.5, 0.5]])]
 
-    #    with open("tests/test_passageIDs1.txt", "r") as passageIDs:
-    #        with open("tests/output_test_passageIDs1.txt", "w") as outfile:
-    #            for ID in passageIDs.readlines():
-    #                pp = vcmsa.PassageParser()
-    #                input_ID = ID.replace("\n", "") 
-    #                full_annotation = pp.parse_passage(input_ID)
-    #                quick_annotation = full_annotation.summary
-    #                outfile.write(",".join(quick_annotation) + "\n")
+        seqnums, seqs_out, names_out = convert_ph_clusters_to_vcmsa_format(labels, seqs, names, hs)
+        # Each noise point should be in its own cluster
+        self.assertEqual(len(seqnums), 3)
+        for cluster in seqnums:
+            self.assertEqual(len(cluster), 1)
 
-    #def test5(self):
-    #    '''
-    #    Check another list of passage IDs
-    #    and write an outfile
-    #    '''
-    #    with open("tests/test_passageIDs2.txt", "r") as passageIDs:
-    #        with open("tests/output_test_passageIDs2.txt", "w") as outfile:
-    #            for ID in passageIDs.readlines():
-    #                pp = vcmsa.PassageParser()
-    #                quick_annotation = pp.parse_passage(ID).summary
-    #                outfile.write(str(",".join(quick_annotation)) + "\n")
-
-    #def test6(self):
-    #    '''
-    #    Test a nonsense passage annotation
-    #    '''
-    #    pp = vcmsa.PassageParser()
-    #    p = pp.parse_passage("asdk?&~EE8")
-    #    self.assertTrue(p.original == "asdk?&~EE8")
-    #    self.assertTrue(p.plain_format == "ASDK_EE8")
-    #    self.assertTrue(p.coerced_format == "")
-    #    self.assertTrue(p.summary == ['asdk?&~EE8', 'ASDK_EE8', '', '', '', '', ''])
-
-    #    self.assertTrue(p.min_passages == "")
-    #    self.assertTrue(p.total_passages == "")
-    #    self.assertTrue(p.nth_passage == "")
-    #    self.assertTrue(p.general_passages== [])
-    #    self.assertTrue(p.specific_passages == [])
-    #    self.assertTrue(p.passage_series == []) 
-    
 
 if __name__ == "__main__":
     pass 

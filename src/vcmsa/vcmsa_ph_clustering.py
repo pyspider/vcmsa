@@ -1,3 +1,4 @@
+import logging
 import numpy as np
 import torch
 from functools import lru_cache
@@ -5,8 +6,11 @@ from scipy.spatial.distance import pdist, squareform, cosine
 from sklearn.cluster import DBSCAN
 from transformers import AutoTokenizer, EsmModel
 
+logger = logging.getLogger(__name__)
+
 
 def _safe_diagram(diagram):
+    """Ensure a persistence diagram is a well-formed (N, 2) float array."""
     if diagram is None:
         return np.empty((0, 2), dtype=float)
     arr = np.asarray(diagram, dtype=float)
@@ -20,6 +24,8 @@ def _safe_diagram(diagram):
 
 @lru_cache(maxsize=2)
 def _load_esm2(model_name, device_type):
+    """Load and cache ESM-2 model and tokenizer."""
+    logger.info("Loading ESM-2 model: %s on %s", model_name, device_type)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = EsmModel.from_pretrained(model_name).to(torch.device(device_type))
     model.eval()
@@ -27,6 +33,11 @@ def _load_esm2(model_name, device_type):
 
 
 def get_esm2_hidden_states(input_sequence, model_name="facebook/esm2_t33_650M_UR50D", layer=-1, device=None):
+    """Extract hidden states from ESM-2 for a single protein sequence.
+
+    Returns per-residue embeddings with [CLS] and [EOS] tokens removed.
+    Shape: (seq_len, embedding_dim)
+    """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer, model = _load_esm2(model_name, str(device))
@@ -48,20 +59,47 @@ def get_esm2_hidden_states(input_sequence, model_name="facebook/esm2_t33_650M_UR
     if layer_idx < 0 or layer_idx >= len(outputs.hidden_states):
         raise ValueError("Invalid hidden-state layer index: {}".format(layer))
 
+    # Remove [CLS] (index 0) and [EOS] (index -1) tokens
     hidden_states = outputs.hidden_states[layer_idx][0, 1:-1, :].detach().cpu().numpy()
     return hidden_states
 
 
-def compute_persistent_homology(hidden_states, max_dimension=3):
+def compute_persistent_homology(hidden_states, max_dimension=3, dimensions=None):
+    """Compute persistent homology from residue-level hidden states.
+
+    Per the HF blog algorithm:
+    1. Compute pairwise Euclidean distance matrix between residue embeddings
+    2. Build Rips complex from the distance matrix
+    3. Compute persistence and extract persistence diagrams
+
+    Parameters
+    ----------
+    hidden_states : ndarray of shape (seq_len, embedding_dim)
+        Per-residue embeddings for one protein.
+    max_dimension : int
+        Maximum simplex dimension for Rips complex construction.
+    dimensions : list of int or None
+        Which homology dimensions to return diagrams for.
+        Default: [0, 1] (connected components and loops).
+
+    Returns
+    -------
+    dict mapping dimension (int) -> persistence diagram (ndarray of shape (N, 2))
+    """
     try:
         import gudhi as gd
     except ImportError as exc:
         raise ImportError("gudhi is required for persistent homology computation") from exc
 
+    if dimensions is None:
+        dimensions = [0, 1]
+
+    empty_result = {dim: np.empty((0, 2), dtype=float) for dim in dimensions}
+
     if hidden_states is None or len(hidden_states) == 0:
-        return np.empty((0, 2), dtype=float)
+        return empty_result
     if len(hidden_states) == 1:
-        return np.array([[0.0, 0.0]], dtype=float)
+        return {dim: np.array([[0.0, 0.0]], dtype=float) for dim in dimensions}
 
     pairwise_distances = pdist(hidden_states, metric="euclidean")
     distance_matrix = squareform(pairwise_distances)
@@ -69,34 +107,88 @@ def compute_persistent_homology(hidden_states, max_dimension=3):
     rips_complex = gd.RipsComplex(distance_matrix=distance_matrix, max_edge_length=max_edge)
     simplex_tree = rips_complex.create_simplex_tree(max_dimension=max_dimension)
     simplex_tree.persistence()
-    persistence_diagram = simplex_tree.persistence_intervals_in_dimension(0)
-    return _safe_diagram(persistence_diagram)
+
+    result = {}
+    for dim in dimensions:
+        intervals = simplex_tree.persistence_intervals_in_dimension(dim)
+        result[dim] = _safe_diagram(intervals)
+
+    return result
 
 
-def compute_wasserstein_distance_matrix(persistent_diagrams, order=1.0):
+def compute_wasserstein_distance_matrix(persistent_diagrams, order=1.0, dimensions=None):
+    """Compute pairwise Wasserstein distances between persistence diagrams.
+
+    Per the HF blog, distances are computed separately for each homology
+    dimension and then summed to produce the final distance matrix.
+
+    Parameters
+    ----------
+    persistent_diagrams : list of dict or list of ndarray
+        If dicts: each maps dimension -> diagram array.
+        If ndarrays (legacy): treated as dimension-0 diagrams only.
+    order : float
+        Order of the Wasserstein distance (default 1.0).
+    dimensions : list of int or None
+        Which dimensions to include in the combined distance.
+        Default: inferred from the first diagram's keys, or [0] for legacy format.
+
+    Returns
+    -------
+    ndarray of shape (num_sequences, num_sequences) with combined Wasserstein distances.
+    """
     try:
         from gudhi.hera import wasserstein_distance
     except ImportError as exc:
         raise ImportError("gudhi[hera] is required for Wasserstein distance computation") from exc
 
     num_diagrams = len(persistent_diagrams)
+    if num_diagrams == 0:
+        return np.zeros((0, 0), dtype=float)
+
+    # Handle legacy format (list of ndarrays = dimension 0 only)
+    is_legacy = not isinstance(persistent_diagrams[0], dict)
+    if is_legacy:
+        persistent_diagrams = [{0: d} for d in persistent_diagrams]
+
+    if dimensions is None:
+        dimensions = sorted(persistent_diagrams[0].keys())
+
     wasserstein_distances = np.zeros((num_diagrams, num_diagrams), dtype=float)
 
-    for i in range(num_diagrams):
-        diag_i = _safe_diagram(persistent_diagrams[i])
-        for j in range(i + 1, num_diagrams):
-            diag_j = _safe_diagram(persistent_diagrams[j])
-            if len(diag_i) == 0 and len(diag_j) == 0:
-                distance = 0.0
-            else:
-                distance = float(wasserstein_distance(diag_i, diag_j, order=order))
-            wasserstein_distances[i, j] = distance
-            wasserstein_distances[j, i] = distance
+    for dim in dimensions:
+        logger.debug("Computing Wasserstein distances for dimension %d", dim)
+        for i in range(num_diagrams):
+            diag_i = _safe_diagram(persistent_diagrams[i].get(dim))
+            for j in range(i + 1, num_diagrams):
+                diag_j = _safe_diagram(persistent_diagrams[j].get(dim))
+                if len(diag_i) == 0 and len(diag_j) == 0:
+                    distance = 0.0
+                else:
+                    distance = float(wasserstein_distance(diag_i, diag_j, order=order))
+                wasserstein_distances[i, j] += distance
+                wasserstein_distances[j, i] += distance
 
     return wasserstein_distances
 
 
 def cluster_by_persistent_homology(wasserstein_distance_matrix, eps=0.5, min_samples=2):
+    """Cluster sequences using DBSCAN on the Wasserstein distance matrix.
+
+    Parameters
+    ----------
+    wasserstein_distance_matrix : ndarray of shape (N, N)
+    eps : float
+        DBSCAN neighborhood radius.
+    min_samples : int
+        Minimum samples in a neighborhood.
+
+    Returns
+    -------
+    cluster_labels : ndarray of shape (N,)
+        Cluster label for each sequence (-1 = noise).
+    clusters : dict mapping label -> list of indices
+    """
     dbscan = DBSCAN(eps=eps, min_samples=min_samples, metric="precomputed")
     cluster_labels = dbscan.fit_predict(wasserstein_distance_matrix)
 
@@ -108,6 +200,17 @@ def cluster_by_persistent_homology(wasserstein_distance_matrix, eps=0.5, min_sam
 
 
 def convert_ph_clusters_to_vcmsa_format(cluster_labels, seqs, seq_names, hidden_states_list):
+    """Convert PH cluster labels to vcMSA-compatible format.
+
+    Noise points (label=-1) are each placed in their own singleton cluster
+    so they can still be processed by the downstream alignment.
+
+    Returns
+    -------
+    cluster_seqnums_list : list of list of int
+    cluster_seqs_list : list of list of str
+    cluster_names_list : list of list of str
+    """
     clusters = {}
     for idx, label in enumerate(cluster_labels):
         if label == -1:
@@ -130,6 +233,10 @@ def convert_ph_clusters_to_vcmsa_format(cluster_labels, seqs, seq_names, hidden_
 
 
 def build_cluster_hidden_states_for_vcmsa(cluster_seqnums_list, hidden_states_list):
+    """Pad hidden states within each cluster to uniform length for do_msa.
+
+    Returns a list of ndarrays, each of shape (num_seqs_in_cluster, max_len, emb_dim).
+    """
     cluster_hstates_list = []
     for indices in cluster_seqnums_list:
         cluster_hidden_states = []
@@ -165,6 +272,15 @@ def build_cluster_hidden_states_for_vcmsa(cluster_seqnums_list, hidden_states_li
 
 
 def identify_rbh_in_clusters(cluster_assignments, hidden_states_list, seq_names=None, threshold=0.8):
+    """Identify reciprocal best hits (RBH) within each cluster.
+
+    Uses mean-pooled hidden states and cosine similarity to find
+    bidirectional best matches within clusters.
+
+    Returns
+    -------
+    list of (name_i, name_j, score) tuples
+    """
     if isinstance(cluster_assignments, dict):
         clusters = cluster_assignments
     else:
@@ -211,3 +327,102 @@ def identify_rbh_in_clusters(cluster_assignments, hidden_states_list, seq_names=
                     rbh_pairs.append((pair[0], pair[1], best_score[i]))
 
     return rbh_pairs
+
+
+def run_ph_pipeline(seqs, seq_names, esm_model="facebook/esm2_t33_650M_UR50D",
+                    ph_layer=-1, ph_eps=0.5, ph_min_samples=2,
+                    ph_dimensions=None, cpu_only=False):
+    """Run the complete persistent homology clustering pipeline.
+
+    This is a convenience function that chains all PH steps:
+    1. Extract ESM-2 hidden states for each sequence
+    2. Compute persistent homology (multi-dimensional)
+    3. Compute Wasserstein distance matrix
+    4. Cluster with DBSCAN
+    5. Convert to vcMSA format
+
+    Parameters
+    ----------
+    seqs : list of str
+        Protein sequences.
+    seq_names : list of str
+        Sequence identifiers.
+    esm_model : str
+        HuggingFace model identifier for ESM-2.
+    ph_layer : int
+        Which hidden layer to extract (-1 = last).
+    ph_eps : float
+        DBSCAN eps parameter.
+    ph_min_samples : int
+        DBSCAN min_samples parameter.
+    ph_dimensions : list of int or None
+        Homology dimensions for persistence (default [0, 1]).
+    cpu_only : bool
+        Force CPU even if GPU is available.
+
+    Returns
+    -------
+    dict with keys:
+        cluster_seqnums_list, cluster_seqs_list, cluster_names_list,
+        cluster_hstates_list, hidden_states_list, rbh_pairs, to_exclude
+    """
+    if ph_dimensions is None:
+        ph_dimensions = [0, 1]
+
+    ph_device = torch.device("cuda" if torch.cuda.is_available() and not cpu_only else "cpu")
+
+    # Step 1: Extract hidden states
+    logger.info("PH Step 1: Extracting ESM-2 hidden states for %d sequences", len(seqs))
+    hidden_states_list = []
+    for idx, seq in enumerate(seqs):
+        hs = get_esm2_hidden_states(seq, model_name=esm_model, layer=ph_layer, device=ph_device)
+        hidden_states_list.append(hs)
+        if (idx + 1) % 10 == 0 or idx == len(seqs) - 1:
+            logger.debug("  Processed %d/%d sequences", idx + 1, len(seqs))
+
+    # Step 2: Compute persistent homology
+    logger.info("PH Step 2: Computing persistent homology (dimensions %s)", ph_dimensions)
+    persistent_diagrams = []
+    for idx, hs in enumerate(hidden_states_list):
+        pd = compute_persistent_homology(hs, dimensions=ph_dimensions)
+        persistent_diagrams.append(pd)
+        if (idx + 1) % 10 == 0 or idx == len(seqs) - 1:
+            logger.debug("  Computed PH for %d/%d sequences", idx + 1, len(seqs))
+
+    # Step 3: Compute Wasserstein distance matrix
+    logger.info("PH Step 3: Computing Wasserstein distance matrix")
+    wasserstein_matrix = compute_wasserstein_distance_matrix(
+        persistent_diagrams, dimensions=ph_dimensions
+    )
+
+    # Step 4: Cluster with DBSCAN
+    logger.info("PH Step 4: Clustering with DBSCAN (eps=%.3f, min_samples=%d)", ph_eps, ph_min_samples)
+    cluster_labels, _ = cluster_by_persistent_homology(
+        wasserstein_matrix, eps=ph_eps, min_samples=ph_min_samples
+    )
+    n_clusters = len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)
+    n_noise = int(np.sum(cluster_labels == -1))
+    logger.info("  Found %d clusters and %d noise points", n_clusters, n_noise)
+
+    # Step 5: Convert to vcMSA format
+    cluster_seqnums_list, cluster_seqs_list, cluster_names_list = \
+        convert_ph_clusters_to_vcmsa_format(cluster_labels, seqs, seq_names, hidden_states_list)
+    cluster_hstates_list = build_cluster_hidden_states_for_vcmsa(
+        cluster_seqnums_list, hidden_states_list
+    )
+
+    # Step 6: Identify RBH pairs
+    rbh_pairs = identify_rbh_in_clusters(
+        cluster_labels, hidden_states_list, seq_names=seq_names
+    )
+    logger.info("PH pipeline complete: %d clusters, %d RBH pairs", len(cluster_seqnums_list), len(rbh_pairs))
+
+    return {
+        "cluster_seqnums_list": cluster_seqnums_list,
+        "cluster_seqs_list": cluster_seqs_list,
+        "cluster_names_list": cluster_names_list,
+        "cluster_hstates_list": cluster_hstates_list,
+        "hidden_states_list": hidden_states_list,
+        "rbh_pairs": rbh_pairs,
+        "to_exclude": [],
+    }
