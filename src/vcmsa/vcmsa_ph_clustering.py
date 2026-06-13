@@ -316,65 +316,35 @@ def get_esm2_hidden_states(input_sequence, model_name="facebook/esm2_t33_650M_UR
     return hidden_states
 
 
-def _minmax_landmark_selection(points, n_landmarks):
-    """Select landmarks using the minmax (greedy farthest point) strategy.
-
-    This preserves topological features better than random subsampling.
-    """
-    n = len(points)
-    if n <= n_landmarks:
-        return np.arange(n)
-
-    selected = [0]
-    min_dist = np.full(n, np.inf)
-
-    for _ in range(1, n_landmarks):
-        last = selected[-1]
-        dists = np.linalg.norm(points - points[last], axis=1)
-        min_dist = np.minimum(min_dist, dists)
-        min_dist[selected] = -1
-        selected.append(int(np.argmax(min_dist)))
-
-    return np.array(selected)
-
-
-def compute_persistent_homology(hidden_states, max_dimension=2, dimensions=None,
-                                max_points=1000, sparse=0.5):
+def compute_persistent_homology(hidden_states, dimensions=None, pca_dim=50):
     """Compute persistent homology from residue-level hidden states.
 
     Per the HF blog algorithm:
     1. Compute pairwise Euclidean distance matrix between residue embeddings
-    2. Build Rips complex from the distance matrix
+    2. Build Rips filtration
     3. Compute persistence and extract persistence diagrams
 
-    For long sequences (> max_points residues), minmax landmark subsampling
-    is applied to keep memory usage tractable.
+    Uses ripser for efficient implicit Rips computation that scales to
+    thousands of residues without building the full simplex tree.
+    PCA dimensionality reduction is applied when the embedding dimension
+    exceeds pca_dim to reduce distance computation cost.
 
     Parameters
     ----------
     hidden_states : ndarray of shape (seq_len, embedding_dim)
         Per-residue embeddings for one protein.
-    max_dimension : int
-        Maximum simplex dimension for Rips complex construction (default 2).
     dimensions : list of int or None
         Which homology dimensions to return diagrams for.
         Default: [0, 1] (connected components and loops).
-    max_points : int
-        Maximum number of points for PH computation. Longer sequences
-        are subsampled using minmax landmark selection (default 1000).
-    sparse : float or None
-        Sparse Rips approximation parameter. None = exact (slower).
-        0.5 gives a good speed/accuracy tradeoff (default 0.5).
+    pca_dim : int
+        Reduce embedding dimension to this many components via PCA
+        before computing distances. Set to 0 or None to disable.
+        Default: 50.
 
     Returns
     -------
     dict mapping dimension (int) -> persistence diagram (ndarray of shape (N, 2))
     """
-    try:
-        import gudhi as gd
-    except ImportError as exc:
-        raise ImportError("gudhi is required for persistent homology computation") from exc
-
     if dimensions is None:
         dimensions = [0, 1]
 
@@ -385,22 +355,47 @@ def compute_persistent_homology(hidden_states, max_dimension=2, dimensions=None,
     if len(hidden_states) == 1:
         return {dim: np.array([[0.0, 0.0]], dtype=float) for dim in dimensions}
 
-    # Subsample long sequences to keep memory tractable
-    n_points = len(hidden_states)
-    if n_points > max_points:
-        logger.debug("Subsampling %d points -> %d landmarks for PH", n_points, max_points)
-        landmark_idx = _minmax_landmark_selection(hidden_states, max_points)
-        hidden_states = hidden_states[landmark_idx]
+    max_dim = max(dimensions)
 
-    pairwise_distances = pdist(hidden_states, metric="euclidean")
+    # PCA dimensionality reduction for high-D embeddings
+    points = hidden_states
+    if pca_dim and hidden_states.shape[1] > pca_dim and len(hidden_states) > pca_dim:
+        from sklearn.decomposition import PCA
+        n_components = min(pca_dim, len(hidden_states), hidden_states.shape[1])
+        points = PCA(n_components=n_components).fit_transform(hidden_states)
+        logger.debug("PCA: %dD -> %dD for %d points",
+                      hidden_states.shape[1], n_components, len(hidden_states))
+
+    try:
+        from ripser import ripser
+        rips_result = ripser(points.astype(np.float32), maxdim=max_dim)
+        result = {}
+        for dim in dimensions:
+            if dim < len(rips_result["dgms"]):
+                dgm = rips_result["dgms"][dim]
+                result[dim] = _safe_diagram(dgm)
+            else:
+                result[dim] = np.empty((0, 2), dtype=float)
+        del rips_result
+        return result
+    except ImportError:
+        pass
+
+    # Fallback to gudhi if ripser is not available
+    try:
+        import gudhi as gd
+    except ImportError as exc:
+        raise ImportError(
+            "Either ripser or gudhi is required for persistent homology. "
+            "Install with: pip install ripser  (recommended for large sequences)"
+        ) from exc
+
+    pairwise_distances = pdist(points, metric="euclidean")
     distance_matrix = squareform(pairwise_distances)
-
-    rips_kwargs = {"distance_matrix": distance_matrix}
-    if sparse is not None:
-        rips_kwargs["sparse"] = sparse
-
-    rips_complex = gd.RipsComplex(**rips_kwargs)
-    simplex_tree = rips_complex.create_simplex_tree(max_dimension=max_dimension)
+    max_edge = float(np.max(distance_matrix))
+    rips_complex = gd.RipsComplex(distance_matrix=distance_matrix,
+                                  max_edge_length=max_edge)
+    simplex_tree = rips_complex.create_simplex_tree(max_dimension=max_dim + 1)
     simplex_tree.persistence()
 
     result = {}

@@ -7,7 +7,6 @@ try:
     from vcmsa.vcmsa_ph_clustering import (
         _safe_diagram,
         _remap_esmc_key,
-        _minmax_landmark_selection,
         compute_persistent_homology,
         compute_wasserstein_distance_matrix,
         cluster_by_persistent_homology,
@@ -72,20 +71,24 @@ class test_vcmsa(unittest.TestCase):
         self.assertEqual(result[0].shape[0], 1)
 
     @unittest.skipUnless(HAS_PH_DEPS, "PH test dependencies are not installed")
-    def test_landmark_subsampling(self):
-        """Test minmax landmark selection and PH with subsampling."""
+    def test_ph_with_pca_and_large_input(self):
+        """Test PH with PCA reduction on larger high-dimensional input."""
         rng = np.random.RandomState(42)
-        # 2000 points in 10D — exceeds default max_points=1000
-        points = rng.randn(2000, 10)
-        landmarks = _minmax_landmark_selection(points, 100)
-        self.assertEqual(len(landmarks), 100)
-        self.assertEqual(len(set(landmarks)), 100)  # all unique
-
-        # PH with subsampling should not OOM and should return valid diagrams
-        result = compute_persistent_homology(points, dimensions=[0, 1], max_points=100)
+        # 500 points in 1152D (simulates ESMC embedding)
+        points = rng.randn(500, 1152).astype(np.float32)
+        result = compute_persistent_homology(points, dimensions=[0, 1], pca_dim=50)
         self.assertIn(0, result)
         self.assertIn(1, result)
         self.assertGreater(result[0].shape[0], 0)
+
+    @unittest.skipUnless(HAS_PH_DEPS, "PH test dependencies are not installed")
+    def test_ph_pca_disabled(self):
+        """Test PH works without PCA when disabled."""
+        rng = np.random.RandomState(42)
+        points = rng.randn(20, 5)
+        result = compute_persistent_homology(points, dimensions=[0, 1], pca_dim=0)
+        self.assertIn(0, result)
+        self.assertIn(1, result)
 
     @unittest.skipUnless(HAS_PH_DEPS, "PH test dependencies are not installed")
     def test_wasserstein_distance_matrix_multidim(self):
