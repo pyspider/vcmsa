@@ -34,6 +34,46 @@ def _remap_esmc_key(key):
     return key
 
 
+def _get_esmc_tokenizer():
+    """Create ESMC tokenizer with compatibility handling.
+
+    Works around the cls_token AttributeError that occurs with certain
+    transformers + esm version combinations.
+    """
+    try:
+        from esm.tokenization import get_esmc_model_tokenizers
+        return get_esmc_model_tokenizers()
+    except (AttributeError, TypeError) as e:
+        logger.warning("get_esmc_model_tokenizers() failed (%s), using fallback", e)
+        from esm.tokenization.sequence_tokenizer import EsmSequenceTokenizer
+        # Bypass __init__ kwargs that conflict with newer transformers
+        # by constructing the tokenizer without special token kwargs
+        import transformers
+        orig_init = transformers.PreTrainedTokenizerFast.__init__
+
+        def _patched_init(self, *args, **kwargs):
+            # Remove special token kwargs that cause AttributeError
+            special_keys = [
+                "cls_token", "eos_token", "pad_token", "unk_token",
+                "mask_token", "bos_token", "sep_token",
+            ]
+            saved = {}
+            for k in special_keys:
+                if k in kwargs:
+                    saved[k] = kwargs.pop(k)
+            orig_init(self, *args, **kwargs)
+            # Set special tokens after init via the internal dict
+            for k, v in saved.items():
+                self._special_tokens_map[k] = v
+
+        transformers.PreTrainedTokenizerFast.__init__ = _patched_init
+        try:
+            tokenizer = EsmSequenceTokenizer()
+        finally:
+            transformers.PreTrainedTokenizerFast.__init__ = orig_init
+        return tokenizer
+
+
 def _load_esmc_model(model_path, device="cpu", use_flash_attn=True):
     """Load ESMC_600M model from a local directory or via from_pretrained.
 
@@ -60,13 +100,13 @@ def _load_esmc_model(model_path, device="cpu", use_flash_attn=True):
     local_dir = Path(model_path)
     if local_dir.is_dir():
         # Local loading with key remapping
-        from esm.tokenization import get_esmc_model_tokenizers
         from safetensors.torch import load_file
 
         logger.info("Loading ESMC_600M from local path: %s", model_path)
+        tokenizer = _get_esmc_tokenizer()
         model = ESMC(
             d_model=1152, n_heads=18, n_layers=36,
-            tokenizer=get_esmc_model_tokenizers(),
+            tokenizer=tokenizer,
             use_flash_attn=use_flash_attn,
         ).eval()
 
@@ -87,14 +127,14 @@ def _load_esmc_model(model_path, device="cpu", use_flash_attn=True):
         # Use from_pretrained (registers local model or downloads)
         logger.info("Loading ESMC model via from_pretrained: %s", model_path)
         import esm.pretrained as esm_pretrained
-        from esm.tokenization import get_esmc_model_tokenizers
         from esm.utils.constants.models import ESMC_600M as ESMC_600M_CONST
 
         # Register a factory that disables flash_attn if device is cpu
         def _factory(device=device, use_flash_attn=use_flash_attn):
+            tokenizer = _get_esmc_tokenizer()
             m = ESMC(
                 d_model=1152, n_heads=18, n_layers=36,
-                tokenizer=get_esmc_model_tokenizers(),
+                tokenizer=tokenizer,
                 use_flash_attn=use_flash_attn,
             ).eval()
             return m.to(device)
