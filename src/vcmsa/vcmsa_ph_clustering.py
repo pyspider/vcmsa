@@ -38,7 +38,8 @@ def _get_esmc_tokenizer():
     """Create ESMC tokenizer with compatibility handling.
 
     Works around the cls_token AttributeError that occurs with certain
-    transformers + esm version combinations.
+    transformers + esm version combinations where the special token
+    property setters are removed or incompatible.
     """
     try:
         from esm.tokenization import get_esmc_model_tokenizers
@@ -46,31 +47,30 @@ def _get_esmc_tokenizer():
     except (AttributeError, TypeError) as e:
         logger.warning("get_esmc_model_tokenizers() failed (%s), using fallback", e)
         from esm.tokenization.sequence_tokenizer import EsmSequenceTokenizer
-        # Bypass __init__ kwargs that conflict with newer transformers
-        # by constructing the tokenizer without special token kwargs
-        import transformers
-        orig_init = transformers.PreTrainedTokenizerFast.__init__
+        # Patch the base class __init__ to swallow AttributeError on
+        # special token setattr calls, then construct the tokenizer.
+        from transformers import tokenization_utils_base
+        orig_init = tokenization_utils_base.SpecialTokensMixin.__init__
 
-        def _patched_init(self, *args, **kwargs):
-            # Remove special token kwargs that cause AttributeError
-            special_keys = [
-                "cls_token", "eos_token", "pad_token", "unk_token",
-                "mask_token", "bos_token", "sep_token",
-            ]
-            saved = {}
-            for k in special_keys:
-                if k in kwargs:
-                    saved[k] = kwargs.pop(k)
-            orig_init(self, *args, **kwargs)
-            # Set special tokens after init via the internal dict
-            for k, v in saved.items():
-                self._special_tokens_map[k] = v
+        def _patched_special_init(self, verbose=True, **kwargs):
+            # Replicate SpecialTokensMixin.__init__ but skip problematic setattr
+            self._special_tokens = {}
+            for key, value in kwargs.items():
+                if value is None:
+                    continue
+                try:
+                    setattr(self, key, value)
+                except AttributeError:
+                    # Property has no setter in this transformers version;
+                    # store in internal dict directly
+                    if hasattr(self, "_special_tokens"):
+                        self._special_tokens[key] = value
 
-        transformers.PreTrainedTokenizerFast.__init__ = _patched_init
+        tokenization_utils_base.SpecialTokensMixin.__init__ = _patched_special_init
         try:
             tokenizer = EsmSequenceTokenizer()
         finally:
-            transformers.PreTrainedTokenizerFast.__init__ = orig_init
+            tokenization_utils_base.SpecialTokensMixin.__init__ = orig_init
         return tokenizer
 
 
