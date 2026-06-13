@@ -728,7 +728,7 @@ def run_ph_pipeline(seqs, seq_names, esm_model="facebook/esm2_t33_650M_UR50D",
     # Free model from GPU memory
     _load_esm2.cache_clear()
     if esm_backend == "esmc":
-        _load_esmc_model.cache_clear()
+        _ESMC_MODEL_CACHE.clear()
     gc.collect()
     if str(ph_device) != "cpu":
         torch.cuda.empty_cache()
