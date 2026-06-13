@@ -175,6 +175,19 @@ def _load_esmc_model(model_path, device="cpu", use_flash_attn=True):
     return model
 
 
+def _tokenize_sequence_manual(sequence, tokenizer):
+    """Manually tokenize a protein sequence using convert_tokens_to_ids.
+
+    Bypasses tokenizer.encode() which has compatibility issues between
+    esm and certain transformers versions. Adds <cls> and <eos> tokens.
+
+    Returns a 1D torch.int64 tensor of token IDs.
+    """
+    tokens = ["<cls>"] + list(sequence) + ["<eos>"]
+    token_ids = tokenizer.convert_tokens_to_ids(tokens)
+    return torch.tensor(token_ids, dtype=torch.int64)
+
+
 def get_esmc_hidden_states(input_sequence, model_path="esmc_600m", layer=-1, device=None):
     """Extract hidden states from ESMC_600M for a single protein sequence.
 
@@ -198,7 +211,7 @@ def get_esmc_hidden_states(input_sequence, model_path="esmc_600m", layer=-1, dev
     ndarray of shape (seq_len, embedding_dim)
         Per-residue hidden states.
     """
-    from esm.sdk.api import ESMProtein, ESMProteinError, LogitsConfig
+    from esm.sdk.api import ESMProteinTensor, ESMProteinError, LogitsConfig
 
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -210,8 +223,12 @@ def get_esmc_hidden_states(input_sequence, model_path="esmc_600m", layer=-1, dev
 
     embedding_config = LogitsConfig(sequence=True, return_hidden_states=True)
 
-    protein = ESMProtein(sequence=input_sequence)
-    protein_tensor = model.encode(protein)
+    # Bypass model.encode() which relies on tokenizer.encode() that has
+    # compatibility issues between esm and transformers versions.
+    # Instead, tokenize manually and create ESMProteinTensor directly.
+    sequence_tokens = _tokenize_sequence_manual(input_sequence, model.tokenizer)
+    protein_tensor = ESMProteinTensor(sequence=sequence_tokens.unsqueeze(0).to(device))
+
     output = model.logits(protein_tensor, embedding_config)
     if isinstance(output, ESMProteinError):
         raise RuntimeError("ESMC inference failed: {}".format(output))
