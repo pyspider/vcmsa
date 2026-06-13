@@ -226,8 +226,9 @@ def get_esmc_hidden_states(input_sequence, model_path="esmc_600m", layer=-1, dev
     # Bypass model.encode() which relies on tokenizer.encode() that has
     # compatibility issues between esm and transformers versions.
     # Instead, tokenize manually and create ESMProteinTensor directly.
+    # Note: do NOT unsqueeze — logits() adds batch dim via _BatchedESMProteinTensor.
     sequence_tokens = _tokenize_sequence_manual(input_sequence, model.tokenizer)
-    protein_tensor = ESMProteinTensor(sequence=sequence_tokens.unsqueeze(0).to(device))
+    protein_tensor = ESMProteinTensor(sequence=sequence_tokens.to(device))
 
     output = model.logits(protein_tensor, embedding_config)
     if isinstance(output, ESMProteinError):
