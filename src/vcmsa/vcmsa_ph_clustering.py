@@ -47,30 +47,42 @@ def _get_esmc_tokenizer():
     except (AttributeError, TypeError) as e:
         logger.warning("get_esmc_model_tokenizers() failed (%s), using fallback", e)
         from esm.tokenization.sequence_tokenizer import EsmSequenceTokenizer
-        # Patch the base class __init__ to swallow AttributeError on
-        # special token setattr calls, then construct the tokenizer.
-        from transformers import tokenization_utils_base
-        orig_init = tokenization_utils_base.SpecialTokensMixin.__init__
 
-        def _patched_special_init(self, verbose=True, **kwargs):
-            # Replicate SpecialTokensMixin.__init__ but skip problematic setattr
-            self._special_tokens = {}
-            for key, value in kwargs.items():
-                if value is None:
+        # The root cause: SpecialTokensMixin defines cls_token etc. as
+        # read-only properties (no setter) in certain transformers versions,
+        # but __init__ tries to setattr them. Fix: temporarily inject setters
+        # that write to the expected backing attribute (_cls_token, etc.).
+        _SPECIAL_ATTRS = [
+            "bos_token", "eos_token", "unk_token", "sep_token",
+            "pad_token", "cls_token", "mask_token", "additional_special_tokens",
+        ]
+
+        patches = {}  # (class, attr_name) -> original_descriptor
+        for attr_name in _SPECIAL_ATTRS:
+            for klass in EsmSequenceTokenizer.__mro__:
+                if attr_name not in klass.__dict__:
                     continue
-                try:
-                    setattr(self, key, value)
-                except AttributeError:
-                    # Property has no setter in this transformers version;
-                    # store in internal dict directly
-                    if hasattr(self, "_special_tokens"):
-                        self._special_tokens[key] = value
+                desc = klass.__dict__[attr_name]
+                if isinstance(desc, property) and desc.fset is None:
+                    backing = "_" + attr_name
 
-        tokenization_utils_base.SpecialTokensMixin.__init__ = _patched_special_init
+                    def _make_setter(bk):
+                        def fset(self, value):
+                            object.__setattr__(self, bk, value)
+                        return fset
+
+                    new_prop = property(desc.fget, _make_setter(backing), desc.fdel, desc.__doc__)
+                    patches[(klass, attr_name)] = desc
+                    setattr(klass, attr_name, new_prop)
+                break
+
         try:
             tokenizer = EsmSequenceTokenizer()
         finally:
-            tokenization_utils_base.SpecialTokensMixin.__init__ = orig_init
+            # Restore original read-only properties
+            for (klass, attr_name), orig_desc in patches.items():
+                setattr(klass, attr_name, orig_desc)
+
         return tokenizer
 
 
