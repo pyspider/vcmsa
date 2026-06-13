@@ -82,8 +82,27 @@ def get_align_args():
 
     parser.add_argument('--log', dest = "loglevel",  choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], default='INFO')
 
-    parser.add_argument("-m", "--model", dest = "model_name",  type = str, required = True,
+    parser.add_argument("-m", "--model", dest = "model_name",  type = str, required = False,
                         help="Model name or path to local model")
+    parser.add_argument("--use_ph_clustering", dest="use_ph_clustering", action="store_true",
+                        help="Use persistent homology clustering to replace vcMSA sequence grouping")
+    parser.add_argument("--esm_model", dest="esm_model", type=str, default="facebook/esm2_t33_650M_UR50D",
+                        help="ESM model identifier or local path for PH clustering")
+    parser.add_argument("--esm_backend", dest="esm_backend", type=str, default="esm2",
+                        choices=["esm2", "esmc"],
+                        help="Model backend: 'esm2' (HuggingFace ESM-2) or 'esmc' (EvolutionaryScale ESMC_600M)")
+    parser.add_argument("--ph_eps", dest="ph_eps", type=float, default=0.5,
+                        help="DBSCAN eps for PH clustering, default = 0.5")
+    parser.add_argument("--ph_min_samples", dest="ph_min_samples", type=int, default=2,
+                        help="DBSCAN min_samples for PH clustering, default = 2")
+    parser.add_argument("--ph_layer", dest="ph_layer", type=int, default=-1,
+                        help="ESM hidden-state layer for PH clustering, default = -1 (last layer)")
+    parser.add_argument("--ph_dimensions", dest="ph_dimensions", nargs="+", type=int, default=[0, 1],
+                        help="Homology dimensions for persistent homology, default = 0 1")
+    parser.add_argument("--embeddings_dir", dest="embeddings_dir", type=str, default=None,
+                        help="Directory to save/load per-residue embeddings (.npy). "
+                             "If set, embeddings are cached on disk and reused across runs. "
+                             "Decouples model inference from PH computation to reduce peak memory.")
 
     parser.add_argument("-co", "--cpu_only", dest = "cpu_only",  action = "store_true",
                         help="If --cpu_only flag is included, will run on cpu even if gpu available")
@@ -135,6 +154,8 @@ def get_align_args():
     parser.add_argument("-dc", "--do_clustering", dest = "do_clustering", action='store_true',
                         help="If flagged, does sequence clustering into subgroups")
     args = parser.parse_args()
+    if not args.use_ph_clustering and args.model_name is None:
+        parser.error("argument -m/--model is required unless --use_ph_clustering is set")
 
     return(args)
 
@@ -840,6 +861,12 @@ if __name__ == '__main__':
     headnorm = args.headnorm
     padding =args.padding
     seqsim_thresh  = args.seqsimthresh 
+    use_ph_clustering = args.use_ph_clustering
+    esm_model = args.esm_model
+    esm_backend = args.esm_backend
+    ph_eps = args.ph_eps
+    ph_min_samples = args.ph_min_samples
+    ph_layer = args.ph_layer
     do_clustering = args.do_clustering
     do_clustering = True
 
@@ -895,6 +922,7 @@ if __name__ == '__main__':
     minscore1 = 0.5
 
     logging.debug("model: {}".format(model_name))
+    logging.debug("use_ph_clustering: {}".format(use_ph_clustering))
     logging.debug("fasta: {}".format(fasta_path))
     logging.debug("padding: {}".format(padding))
     logging.debug("first score thresholds: {}".format(minscore1))
@@ -908,44 +936,65 @@ if __name__ == '__main__':
 
  
 
-    # The first step is to get embeddings
-    if embedding_path:
-       with open(embedding_path, "rb") as f:
-             embedding_dict = pickle.load(f)
+    if use_ph_clustering:
+        from vcmsa.vcmsa_ph_clustering import run_ph_pipeline
 
+        ph_dimensions = args.ph_dimensions
+        ph_result = run_ph_pipeline(
+            seqs, seq_names,
+            esm_model=esm_model,
+            ph_layer=ph_layer,
+            ph_eps=ph_eps,
+            ph_min_samples=ph_min_samples,
+            ph_dimensions=ph_dimensions,
+            cpu_only=cpu_only,
+            esm_backend=esm_backend,
+            embeddings_dir=args.embeddings_dir,
+        )
+        cluster_seqnums_list = ph_result["cluster_seqnums_list"]
+        cluster_seqs_list = ph_result["cluster_seqs_list"]
+        cluster_names_list = ph_result["cluster_names_list"]
+        cluster_hstates_list = ph_result["cluster_hstates_list"]
+        to_exclude = ph_result["to_exclude"]
     else:
-        seqlens = [len(x) for x in seqs]
-       #print("printing model_name:")
-       #print(model_name)
-       #print("printing seq_lens")
-       #print(seqlens)
-       #print("printing layers")
-       #print(layers)
-       #print("printing padding")
-       #print(padding)
-        #print("printing headnames")
-        #print(headnames)
-        embedding_dict = get_embeddings(seqs_spaced,
-                                    model_name,
-                                    seqlens = seqlens,
-                                    get_sequence_embeddings = True,
-                                    get_aa_embeddings = True,
-                                    layers = layers,  
-                                    padding = padding,
-                                    heads = headnames,
-                                    cpu_only = cpu_only, 
-                                    half = False)
-        if emb_outfile:
-           with open(emb_outfile, "wb") as fOut:
-               pickle.dump(embedding_dict, fOut, protocol=pickle.HIGHEST_PROTOCOL)
+        # The first step is to get embeddings
+        if embedding_path:
+           with open(embedding_path, "rb") as f:
+                 embedding_dict = pickle.load(f)
 
-        if embed_only:
-            #print("Quiting after saving embedding at {}".format(emb_outfile))
-            exit(0)
+        else:
+            seqlens = [len(x) for x in seqs]
+           #print("printing model_name:")
+           #print(model_name)
+           #print("printing seq_lens")
+           #print(seqlens)
+           #print("printing layers")
+           #print(layers)
+           #print("printing padding")
+           #print(padding)
+            #print("printing headnames")
+            #print(headnames)
+            embedding_dict = get_embeddings(seqs_spaced,
+                                        model_name,
+                                        seqlens = seqlens,
+                                        get_sequence_embeddings = True,
+                                        get_aa_embeddings = True,
+                                        layers = layers,  
+                                        padding = padding,
+                                        heads = headnames,
+                                        cpu_only = cpu_only, 
+                                        half = False)
+            if emb_outfile:
+               with open(emb_outfile, "wb") as fOut:
+                   pickle.dump(embedding_dict, fOut, protocol=pickle.HIGHEST_PROTOCOL)
 
-    # The sequences are divided into groups
-    #ic(seqsim_thresh)
-    cluster_seqnums_list, cluster_seqs_list,  cluster_names_list, cluster_hstates_list, to_exclude = get_seq_groups(seqs ,seq_names, embedding_dict,  exclude, do_clustering, outfile_name, record_dir, seqsim_thresh = seqsim_thresh, pca_plot = pca_plot )
+            if embed_only:
+                #print("Quiting after saving embedding at {}".format(emb_outfile))
+                exit(0)
+
+        # The sequences are divided into groups
+        #ic(seqsim_thresh)
+        cluster_seqnums_list, cluster_seqs_list,  cluster_names_list, cluster_hstates_list, to_exclude = get_seq_groups(seqs ,seq_names, embedding_dict,  exclude, do_clustering, outfile_name, record_dir, seqsim_thresh = seqsim_thresh, pca_plot = pca_plot )
 
     aln_fasta_list = []
     excluded_records = []
