@@ -620,17 +620,34 @@ def identify_rbh_in_clusters(cluster_assignments, hidden_states_list, seq_names=
     return rbh_pairs
 
 
+def _save_hidden_states(hs, seq_name, save_dir):
+    """Save per-residue hidden states to a .npy file on disk."""
+    import re
+    safe_name = re.sub(r'[^\w\-.]', '_', seq_name)
+    path = Path(save_dir) / "{}.npy".format(safe_name)
+    np.save(str(path), hs)
+    return str(path)
+
+
+def _load_hidden_states(path):
+    """Load per-residue hidden states from a .npy file."""
+    return np.load(path)
+
+
 def run_ph_pipeline(seqs, seq_names, esm_model="facebook/esm2_t33_650M_UR50D",
                     ph_layer=-1, ph_eps=0.5, ph_min_samples=2,
-                    ph_dimensions=None, cpu_only=False, esm_backend="esm2"):
+                    ph_dimensions=None, cpu_only=False, esm_backend="esm2",
+                    embeddings_dir=None):
     """Run the complete persistent homology clustering pipeline.
 
-    This is a convenience function that chains all PH steps:
-    1. Extract hidden states (ESM-2 or ESMC)
-    2. Compute persistent homology (multi-dimensional)
-    3. Compute Wasserstein distance matrix
-    4. Cluster with DBSCAN
-    5. Convert to vcMSA format
+    Uses a two-phase disk-based approach to minimize peak memory:
+      Phase 1: Extract hidden states one sequence at a time, save each
+               to a .npy file on disk, then free GPU/CPU memory.
+      Phase 2: Load each .npy file, compute persistent homology,
+               then free the large (seq_len, D) array.
+
+    This ensures that model inference memory and PH computation memory
+    never overlap.
 
     Parameters
     ----------
@@ -653,6 +670,10 @@ def run_ph_pipeline(seqs, seq_names, esm_model="facebook/esm2_t33_650M_UR50D",
         Force CPU even if GPU is available.
     esm_backend : str
         Which model backend to use: "esm2" (default) or "esmc".
+    embeddings_dir : str or None
+        Directory to save/load per-residue embeddings (.npy files).
+        If None, a temporary directory is created and cleaned up after.
+        If a directory is provided, embeddings are persisted for reuse.
 
     Returns
     -------
@@ -660,34 +681,71 @@ def run_ph_pipeline(seqs, seq_names, esm_model="facebook/esm2_t33_650M_UR50D",
         cluster_seqnums_list, cluster_seqs_list, cluster_names_list,
         cluster_hstates_list, hidden_states_list, rbh_pairs, to_exclude
     """
+    import gc
+
     if ph_dimensions is None:
         ph_dimensions = [0, 1]
 
     ph_device = torch.device("cuda" if torch.cuda.is_available() and not cpu_only else "cpu")
 
-    # Steps 1+2: Extract hidden states and compute PH incrementally.
-    # We compute PH immediately after each sequence to avoid holding all
-    # full-resolution hidden states in memory simultaneously.
-    backend_label = esm_backend.upper()
-    logger.info("PH Steps 1-2: Extracting %s hidden states and computing PH "
-                "(dimensions %s) for %d sequences", backend_label, ph_dimensions, len(seqs))
-    hidden_states_list = []
-    persistent_diagrams = []
-    for idx, seq in enumerate(seqs):
-        if esm_backend == "esmc":
-            hs = get_esmc_hidden_states(seq, model_path=esm_model, layer=ph_layer, device=ph_device)
-        else:
-            hs = get_esm2_hidden_states(seq, model_name=esm_model, layer=ph_layer, device=ph_device)
+    # Set up embeddings directory
+    cleanup_dir = False
+    if embeddings_dir is None:
+        import tempfile
+        embeddings_dir = tempfile.mkdtemp(prefix="vcmsa_ph_embeddings_")
+        cleanup_dir = True
+    else:
+        Path(embeddings_dir).mkdir(parents=True, exist_ok=True)
 
+    backend_label = esm_backend.upper()
+
+    # ── Phase 1: Model inference → save .npy to disk ──
+    logger.info("PH Phase 1: Extracting %s hidden states (layer %s) for "
+                "%d sequences -> %s", backend_label, ph_layer, len(seqs), embeddings_dir)
+    npy_paths = []
+    for idx, (seq, name) in enumerate(zip(seqs, seq_names)):
+        npy_path = Path(embeddings_dir) / "{}.npy".format(idx)
+        if npy_path.exists():
+            logger.debug("  [%d/%d] %s: using cached embedding", idx + 1, len(seqs), name)
+            npy_paths.append(str(npy_path))
+            continue
+
+        if esm_backend == "esmc":
+            hs = get_esmc_hidden_states(seq, model_path=esm_model,
+                                        layer=ph_layer, device=ph_device)
+        else:
+            hs = get_esm2_hidden_states(seq, model_name=esm_model,
+                                        layer=ph_layer, device=ph_device)
+        np.save(str(npy_path), hs)
+        npy_paths.append(str(npy_path))
+        del hs
+        gc.collect()
+
+        if (idx + 1) % 10 == 0 or idx == len(seqs) - 1:
+            logger.info("  Saved %d/%d embeddings (seq len %d)", idx + 1, len(seqs), len(seq))
+
+    # Free model from GPU memory before PH computation
+    _load_esm2.cache_clear()
+    if esm_backend == "esmc":
+        _load_esmc_model.cache_clear()
+    gc.collect()
+    if str(ph_device) != "cpu":
+        torch.cuda.empty_cache()
+    logger.info("PH Phase 1 complete. Model memory released.")
+
+    # ── Phase 2: Load .npy → compute PH → free ──
+    logger.info("PH Phase 2: Computing persistent homology (dimensions %s)", ph_dimensions)
+    persistent_diagrams = []
+    hidden_states_list = []
+    for idx, npy_path in enumerate(npy_paths):
+        hs = np.load(npy_path)
         pd = compute_persistent_homology(hs, dimensions=ph_dimensions)
         persistent_diagrams.append(pd)
-
-        # Keep a mean-pooled summary (1, D) for downstream RBH/alignment
-        # instead of the full (L, D) matrix to save memory on long sequences.
         hidden_states_list.append(hs)
 
         if (idx + 1) % 10 == 0 or idx == len(seqs) - 1:
-            logger.info("  Processed %d/%d sequences (seq len %d)", idx + 1, len(seqs), len(seq))
+            logger.info("  Computed PH for %d/%d sequences (shape %s)",
+                        idx + 1, len(seqs), hs.shape)
 
     # Step 3: Compute Wasserstein distance matrix
     logger.info("PH Step 3: Computing Wasserstein distance matrix")
@@ -716,6 +774,11 @@ def run_ph_pipeline(seqs, seq_names, esm_model="facebook/esm2_t33_650M_UR50D",
         cluster_labels, hidden_states_list, seq_names=seq_names
     )
     logger.info("PH pipeline complete: %d clusters, %d RBH pairs", len(cluster_seqnums_list), len(rbh_pairs))
+
+    # Clean up temp directory if we created it
+    if cleanup_dir:
+        import shutil
+        shutil.rmtree(embeddings_dir, ignore_errors=True)
 
     return {
         "cluster_seqnums_list": cluster_seqnums_list,

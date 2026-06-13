@@ -99,6 +99,10 @@ def get_align_args():
                         help="ESM hidden-state layer for PH clustering, default = -1 (last layer)")
     parser.add_argument("--ph_dimensions", dest="ph_dimensions", nargs="+", type=int, default=[0, 1],
                         help="Homology dimensions for persistent homology, default = 0 1")
+    parser.add_argument("--embeddings_dir", dest="embeddings_dir", type=str, default=None,
+                        help="Directory to save/load per-residue embeddings (.npy). "
+                             "If set, embeddings are cached on disk and reused across runs. "
+                             "Decouples model inference from PH computation to reduce peak memory.")
 
     parser.add_argument("-co", "--cpu_only", dest = "cpu_only",  action = "store_true",
                         help="If --cpu_only flag is included, will run on cpu even if gpu available")
@@ -945,6 +949,7 @@ if __name__ == '__main__':
             ph_dimensions=ph_dimensions,
             cpu_only=cpu_only,
             esm_backend=esm_backend,
+            embeddings_dir=args.embeddings_dir,
         )
         cluster_seqnums_list = ph_result["cluster_seqnums_list"]
         cluster_seqs_list = ph_result["cluster_seqs_list"]
