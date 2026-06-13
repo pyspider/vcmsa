@@ -165,27 +165,26 @@ class test_vcmsa(unittest.TestCase):
         self.assertGreaterEqual(pair_scores[("a", "b")], 0.8)
 
     @unittest.skipUnless(HAS_PH_DEPS, "PH test dependencies are not installed")
-    def test_full_ph_pipeline_integration(self):
-        """Integration test: full PH pipeline with synthetic data."""
-        # Generate two groups of "sequences" with distinct hidden states
+    def test_full_pipeline_mean_pool_clustering(self):
+        """Integration test: mean-pool + cosine distance clustering."""
+        from scipy.spatial.distance import pdist, squareform
         np.random.seed(42)
-        # Group 1: similar hidden states (clustered around [1, 0])
-        hs_group1 = [np.random.normal(loc=[1, 0], scale=0.1, size=(5, 2)) for _ in range(3)]
-        # Group 2: similar hidden states (clustered around [0, 1])
-        hs_group2 = [np.random.normal(loc=[0, 1], scale=0.1, size=(5, 2)) for _ in range(3)]
+        # Group 1: embeddings clustered around [1, 0]
+        hs_group1 = [np.random.normal(loc=[1, 0], scale=0.05, size=(5, 2)) for _ in range(3)]
+        # Group 2: embeddings clustered around [0, 1]
+        hs_group2 = [np.random.normal(loc=[0, 1], scale=0.05, size=(5, 2)) for _ in range(3)]
         all_hs = hs_group1 + hs_group2
 
-        # Compute PH for each
-        diagrams = [compute_persistent_homology(hs, dimensions=[0]) for hs in all_hs]
+        # Mean pool
+        mean_pooled = np.array([np.mean(hs, axis=0) for hs in all_hs])
+        self.assertEqual(mean_pooled.shape, (6, 2))
 
-        # Compute Wasserstein matrix
-        matrix = compute_wasserstein_distance_matrix(diagrams, dimensions=[0])
-        self.assertEqual(matrix.shape, (6, 6))
+        # Cosine distance matrix
+        dist_matrix = squareform(pdist(mean_pooled, metric="cosine"))
+        self.assertEqual(dist_matrix.shape, (6, 6))
 
-        # Cluster - with appropriate eps for this synthetic data
-        labels, clusters = cluster_by_persistent_homology(matrix, eps=1.0, min_samples=2)
-
-        # Should find at least some clustering structure
+        # Cluster
+        labels, clusters = cluster_by_persistent_homology(dist_matrix, eps=0.5, min_samples=2)
         n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
         self.assertGreaterEqual(n_clusters, 1)
 
@@ -242,12 +241,14 @@ class test_vcmsa(unittest.TestCase):
 
     @unittest.skipUnless(HAS_PH_DEPS, "PH test dependencies are not installed")
     def test_run_ph_pipeline_accepts_esm_backend(self):
-        """Test that run_ph_pipeline signature accepts esm_backend parameter."""
+        """Test that run_ph_pipeline signature accepts expected parameters."""
         from vcmsa.vcmsa_ph_clustering import run_ph_pipeline
         import inspect
         sig = inspect.signature(run_ph_pipeline)
         self.assertIn("esm_backend", sig.parameters)
         self.assertEqual(sig.parameters["esm_backend"].default, "esm2")
+        self.assertIn("embeddings_dir", sig.parameters)
+        self.assertIsNone(sig.parameters["embeddings_dir"].default)
 
     @unittest.skipUnless(HAS_PH_DEPS, "PH test dependencies are not installed")
     def test_get_esmc_hidden_states_importable(self):
