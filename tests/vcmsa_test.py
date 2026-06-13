@@ -6,6 +6,7 @@ try:
     import numpy as np
     from vcmsa.vcmsa_ph_clustering import (
         _safe_diagram,
+        _remap_esmc_key,
         compute_persistent_homology,
         compute_wasserstein_distance_matrix,
         cluster_by_persistent_homology,
@@ -181,6 +182,65 @@ class test_vcmsa(unittest.TestCase):
         self.assertEqual(len(seqnums), 3)
         for cluster in seqnums:
             self.assertEqual(len(cluster), 1)
+
+
+    @unittest.skipUnless(HAS_PH_DEPS, "PH test dependencies are not installed")
+    def test_remap_esmc_key(self):
+        """Test ESMC key remapping logic."""
+        # _extra_state keys should be dropped
+        self.assertIsNone(_remap_esmc_key("layer._extra_state"))
+
+        # esmc. prefix stripped
+        self.assertEqual(_remap_esmc_key("esmc.encoder.layer"), "encoder.layer")
+
+        # lm_head -> sequence_head
+        self.assertEqual(_remap_esmc_key("lm_head.weight"), "sequence_head.weight")
+
+        # ffn replacements
+        self.assertEqual(
+            _remap_esmc_key("blocks.0.ffn.layer_norm_weight"),
+            "blocks.0.ffn.0.weight"
+        )
+        self.assertEqual(
+            _remap_esmc_key("blocks.0.ffn.fc1_weight"),
+            "blocks.0.ffn.1.weight"
+        )
+        self.assertEqual(
+            _remap_esmc_key("blocks.0.ffn.fc2_weight"),
+            "blocks.0.ffn.3.weight"
+        )
+
+        # attn layernorm replacements
+        self.assertEqual(
+            _remap_esmc_key("blocks.0.attn.layernorm_qkv.layer_norm_weight"),
+            "blocks.0.attn.layernorm_qkv.0.weight"
+        )
+        self.assertEqual(
+            _remap_esmc_key("blocks.0.attn.layernorm_qkv.weight"),
+            "blocks.0.attn.layernorm_qkv.1.weight"
+        )
+
+    @unittest.skipUnless(HAS_PH_DEPS, "PH test dependencies are not installed")
+    def test_run_ph_pipeline_accepts_esm_backend(self):
+        """Test that run_ph_pipeline signature accepts esm_backend parameter."""
+        from vcmsa.vcmsa_ph_clustering import run_ph_pipeline
+        import inspect
+        sig = inspect.signature(run_ph_pipeline)
+        self.assertIn("esm_backend", sig.parameters)
+        self.assertEqual(sig.parameters["esm_backend"].default, "esm2")
+
+    @unittest.skipUnless(HAS_PH_DEPS, "PH test dependencies are not installed")
+    def test_get_esmc_hidden_states_importable(self):
+        """Test that get_esmc_hidden_states is importable and has correct signature."""
+        from vcmsa.vcmsa_ph_clustering import get_esmc_hidden_states
+        import inspect
+        sig = inspect.signature(get_esmc_hidden_states)
+        self.assertIn("input_sequence", sig.parameters)
+        self.assertIn("model_path", sig.parameters)
+        self.assertIn("layer", sig.parameters)
+        self.assertIn("device", sig.parameters)
+        self.assertEqual(sig.parameters["model_path"].default, "esmc_600m")
+        self.assertEqual(sig.parameters["layer"].default, -1)
 
 
 if __name__ == "__main__":

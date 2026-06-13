@@ -2,11 +2,174 @@ import logging
 import numpy as np
 import torch
 from functools import lru_cache
+from pathlib import Path
 from scipy.spatial.distance import pdist, squareform, cosine
 from sklearn.cluster import DBSCAN
 from transformers import AutoTokenizer, EsmModel
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# ESMC_600M support
+# ---------------------------------------------------------------------------
+
+_ESMC_MODEL_CACHE = {}
+
+
+def _remap_esmc_key(key):
+    """Remap safetensors weight keys to ESMC model state_dict keys."""
+    if "_extra_state" in key:
+        return None
+    if key.startswith("esmc."):
+        key = key[len("esmc."):]
+    if key.startswith("lm_head."):
+        key = "sequence_head." + key[len("lm_head."):]
+    key = key.replace(".ffn.layer_norm_weight", ".ffn.0.weight")
+    key = key.replace(".ffn.layer_norm_bias", ".ffn.0.bias")
+    key = key.replace(".ffn.fc1_weight", ".ffn.1.weight")
+    key = key.replace(".ffn.fc2_weight", ".ffn.3.weight")
+    key = key.replace(".attn.layernorm_qkv.layer_norm_weight", ".attn.layernorm_qkv.0.weight")
+    key = key.replace(".attn.layernorm_qkv.layer_norm_bias", ".attn.layernorm_qkv.0.bias")
+    key = key.replace(".attn.layernorm_qkv.weight", ".attn.layernorm_qkv.1.weight")
+    return key
+
+
+def _load_esmc_model(model_path, device="cpu", use_flash_attn=True):
+    """Load ESMC_600M model from a local directory or via from_pretrained.
+
+    Parameters
+    ----------
+    model_path : str
+        Either a local directory containing *.safetensors files, or
+        a pretrained identifier like "esmc_600m".
+    device : str
+        Target device ("cpu" or "cuda").
+    use_flash_attn : bool
+        Whether to enable flash attention.
+
+    Returns
+    -------
+    model : ESMC model instance (eval mode, on device).
+    """
+    cache_key = (model_path, device)
+    if cache_key in _ESMC_MODEL_CACHE:
+        return _ESMC_MODEL_CACHE[cache_key]
+
+    from esm.models.esmc import ESMC
+
+    local_dir = Path(model_path)
+    if local_dir.is_dir():
+        # Local loading with key remapping
+        from esm.tokenization import get_esmc_model_tokenizers
+        from safetensors.torch import load_file
+
+        logger.info("Loading ESMC_600M from local path: %s", model_path)
+        model = ESMC(
+            d_model=1152, n_heads=18, n_layers=36,
+            tokenizer=get_esmc_model_tokenizers(),
+            use_flash_attn=use_flash_attn,
+        ).eval()
+
+        raw_state_dict = {}
+        for f in sorted(local_dir.glob("*.safetensors")):
+            logger.debug("  Loading %s", f.name)
+            raw_state_dict.update(load_file(f, device=device))
+
+        remapped = {}
+        for k, v in raw_state_dict.items():
+            new_key = _remap_esmc_key(k)
+            if new_key is not None:
+                remapped[new_key] = v
+
+        model.load_state_dict(remapped, strict=True)
+        model = model.to(device)
+    else:
+        # Use from_pretrained (registers local model or downloads)
+        logger.info("Loading ESMC model via from_pretrained: %s", model_path)
+        import esm.pretrained as esm_pretrained
+        from esm.tokenization import get_esmc_model_tokenizers
+        from esm.utils.constants.models import ESMC_600M as ESMC_600M_CONST
+
+        # Register a factory that disables flash_attn if device is cpu
+        def _factory(device=device, use_flash_attn=use_flash_attn):
+            m = ESMC(
+                d_model=1152, n_heads=18, n_layers=36,
+                tokenizer=get_esmc_model_tokenizers(),
+                use_flash_attn=use_flash_attn,
+            ).eval()
+            return m.to(device)
+
+        if ESMC_600M_CONST not in esm_pretrained.LOCAL_MODEL_REGISTRY:
+            esm_pretrained.LOCAL_MODEL_REGISTRY[ESMC_600M_CONST] = _factory
+
+        model = ESMC.from_pretrained(model_path).to(device)
+
+    _ESMC_MODEL_CACHE[cache_key] = model
+    logger.info("ESMC model loaded on %s", device)
+    return model
+
+
+def get_esmc_hidden_states(input_sequence, model_path="esmc_600m", layer=-1, device=None):
+    """Extract hidden states from ESMC_600M for a single protein sequence.
+
+    Returns per-residue embeddings from the specified layer, with special
+    tokens removed. Shape: (seq_len, embedding_dim)
+
+    Parameters
+    ----------
+    input_sequence : str
+        Amino acid sequence.
+    model_path : str
+        Path to local ESMC model directory, or "esmc_600m" for pretrained.
+    layer : int
+        Which hidden layer to extract. -1 = last layer, 0-indexed otherwise.
+        ESMC_600M has 36 layers (indices 0..35).
+    device : torch.device or None
+        Target device. Auto-detects GPU if None.
+
+    Returns
+    -------
+    ndarray of shape (seq_len, embedding_dim)
+        Per-residue hidden states.
+    """
+    from esm.sdk.api import ESMProtein, ESMProteinError, LogitsConfig
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device_str = str(device)
+
+    # Disable flash attention on CPU
+    use_flash_attn = (device_str != "cpu")
+    model = _load_esmc_model(model_path, device=device_str, use_flash_attn=use_flash_attn)
+
+    embedding_config = LogitsConfig(sequence=True, return_hidden_states=True)
+
+    protein = ESMProtein(sequence=input_sequence)
+    protein_tensor = model.encode(protein)
+    output = model.logits(protein_tensor, embedding_config)
+    if isinstance(output, ESMProteinError):
+        raise RuntimeError("ESMC inference failed: {}".format(output))
+
+    # output.hidden_states shape: (n_layers, 1, L, D)
+    # Remove batch dim and special tokens (first and last)
+    hs = output.hidden_states  # (n_layers, 1, L, D)
+    hs = hs[:, 0, 1:-1, :]    # (n_layers, seq_len, D)
+
+    n_layers = hs.shape[0]
+    if layer == -1 or layer is None:
+        layer_idx = n_layers - 1
+    elif layer < 0:
+        layer_idx = n_layers + layer
+    else:
+        layer_idx = layer
+
+    if layer_idx < 0 or layer_idx >= n_layers:
+        raise ValueError(
+            "Invalid layer index {} for ESMC model with {} layers".format(layer, n_layers)
+        )
+
+    hidden_states = hs[layer_idx].float().detach().cpu().numpy()  # (seq_len, D)
+    return hidden_states
 
 
 def _safe_diagram(diagram):
@@ -331,11 +494,11 @@ def identify_rbh_in_clusters(cluster_assignments, hidden_states_list, seq_names=
 
 def run_ph_pipeline(seqs, seq_names, esm_model="facebook/esm2_t33_650M_UR50D",
                     ph_layer=-1, ph_eps=0.5, ph_min_samples=2,
-                    ph_dimensions=None, cpu_only=False):
+                    ph_dimensions=None, cpu_only=False, esm_backend="esm2"):
     """Run the complete persistent homology clustering pipeline.
 
     This is a convenience function that chains all PH steps:
-    1. Extract ESM-2 hidden states for each sequence
+    1. Extract hidden states (ESM-2 or ESMC)
     2. Compute persistent homology (multi-dimensional)
     3. Compute Wasserstein distance matrix
     4. Cluster with DBSCAN
@@ -348,7 +511,8 @@ def run_ph_pipeline(seqs, seq_names, esm_model="facebook/esm2_t33_650M_UR50D",
     seq_names : list of str
         Sequence identifiers.
     esm_model : str
-        HuggingFace model identifier for ESM-2.
+        Model identifier. For esm2 backend: HuggingFace model name.
+        For esmc backend: local path or "esmc_600m".
     ph_layer : int
         Which hidden layer to extract (-1 = last).
     ph_eps : float
@@ -359,6 +523,8 @@ def run_ph_pipeline(seqs, seq_names, esm_model="facebook/esm2_t33_650M_UR50D",
         Homology dimensions for persistence (default [0, 1]).
     cpu_only : bool
         Force CPU even if GPU is available.
+    esm_backend : str
+        Which model backend to use: "esm2" (default) or "esmc".
 
     Returns
     -------
@@ -372,10 +538,14 @@ def run_ph_pipeline(seqs, seq_names, esm_model="facebook/esm2_t33_650M_UR50D",
     ph_device = torch.device("cuda" if torch.cuda.is_available() and not cpu_only else "cpu")
 
     # Step 1: Extract hidden states
-    logger.info("PH Step 1: Extracting ESM-2 hidden states for %d sequences", len(seqs))
+    backend_label = esm_backend.upper()
+    logger.info("PH Step 1: Extracting %s hidden states for %d sequences", backend_label, len(seqs))
     hidden_states_list = []
     for idx, seq in enumerate(seqs):
-        hs = get_esm2_hidden_states(seq, model_name=esm_model, layer=ph_layer, device=ph_device)
+        if esm_backend == "esmc":
+            hs = get_esmc_hidden_states(seq, model_path=esm_model, layer=ph_layer, device=ph_device)
+        else:
+            hs = get_esm2_hidden_states(seq, model_name=esm_model, layer=ph_layer, device=ph_device)
         hidden_states_list.append(hs)
         if (idx + 1) % 10 == 0 or idx == len(seqs) - 1:
             logger.debug("  Processed %d/%d sequences", idx + 1, len(seqs))

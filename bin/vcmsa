@@ -87,7 +87,10 @@ def get_align_args():
     parser.add_argument("--use_ph_clustering", dest="use_ph_clustering", action="store_true",
                         help="Use persistent homology clustering to replace vcMSA sequence grouping")
     parser.add_argument("--esm_model", dest="esm_model", type=str, default="facebook/esm2_t33_650M_UR50D",
-                        help="ESM-2 model identifier for PH clustering")
+                        help="ESM model identifier or local path for PH clustering")
+    parser.add_argument("--esm_backend", dest="esm_backend", type=str, default="esm2",
+                        choices=["esm2", "esmc"],
+                        help="Model backend: 'esm2' (HuggingFace ESM-2) or 'esmc' (EvolutionaryScale ESMC_600M)")
     parser.add_argument("--ph_eps", dest="ph_eps", type=float, default=0.5,
                         help="DBSCAN eps for PH clustering, default = 0.5")
     parser.add_argument("--ph_min_samples", dest="ph_min_samples", type=int, default=2,
@@ -856,6 +859,7 @@ if __name__ == '__main__':
     seqsim_thresh  = args.seqsimthresh 
     use_ph_clustering = args.use_ph_clustering
     esm_model = args.esm_model
+    esm_backend = args.esm_backend
     ph_eps = args.ph_eps
     ph_min_samples = args.ph_min_samples
     ph_layer = args.ph_layer
@@ -940,6 +944,7 @@ if __name__ == '__main__':
             ph_min_samples=ph_min_samples,
             ph_dimensions=ph_dimensions,
             cpu_only=cpu_only,
+            esm_backend=esm_backend,
         )
         cluster_seqnums_list = ph_result["cluster_seqnums_list"]
         cluster_seqs_list = ph_result["cluster_seqs_list"]
