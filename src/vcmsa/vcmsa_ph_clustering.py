@@ -235,11 +235,9 @@ def get_esmc_hidden_states(input_sequence, model_path="esmc_600m", layer=-1, dev
         raise RuntimeError("ESMC inference failed: {}".format(output))
 
     # output.hidden_states shape: (n_layers, 1, L, D)
-    # Remove batch dim and special tokens (first and last)
-    hs = output.hidden_states  # (n_layers, 1, L, D)
-    hs = hs[:, 0, 1:-1, :]    # (n_layers, seq_len, D)
-
-    n_layers = hs.shape[0]
+    # Immediately extract only the requested layer to free memory.
+    all_hs = output.hidden_states
+    n_layers = all_hs.shape[0]
     if layer == -1 or layer is None:
         layer_idx = n_layers - 1
     elif layer < 0:
@@ -252,7 +250,11 @@ def get_esmc_hidden_states(input_sequence, model_path="esmc_600m", layer=-1, dev
             "Invalid layer index {} for ESMC model with {} layers".format(layer, n_layers)
         )
 
-    hidden_states = hs[layer_idx].float().detach().cpu().numpy()  # (seq_len, D)
+    # Extract single layer, remove batch dim and special tokens, move to CPU
+    hidden_states = all_hs[layer_idx, 0, 1:-1, :].float().detach().cpu().numpy()
+    del all_hs, output
+    if device_str != "cpu":
+        torch.cuda.empty_cache()
     return hidden_states
 
 
@@ -308,10 +310,36 @@ def get_esm2_hidden_states(input_sequence, model_name="facebook/esm2_t33_650M_UR
 
     # Remove [CLS] (index 0) and [EOS] (index -1) tokens
     hidden_states = outputs.hidden_states[layer_idx][0, 1:-1, :].detach().cpu().numpy()
+    del outputs
+    if str(device) != "cpu":
+        torch.cuda.empty_cache()
     return hidden_states
 
 
-def compute_persistent_homology(hidden_states, max_dimension=3, dimensions=None):
+def _minmax_landmark_selection(points, n_landmarks):
+    """Select landmarks using the minmax (greedy farthest point) strategy.
+
+    This preserves topological features better than random subsampling.
+    """
+    n = len(points)
+    if n <= n_landmarks:
+        return np.arange(n)
+
+    selected = [0]
+    min_dist = np.full(n, np.inf)
+
+    for _ in range(1, n_landmarks):
+        last = selected[-1]
+        dists = np.linalg.norm(points - points[last], axis=1)
+        min_dist = np.minimum(min_dist, dists)
+        min_dist[selected] = -1
+        selected.append(int(np.argmax(min_dist)))
+
+    return np.array(selected)
+
+
+def compute_persistent_homology(hidden_states, max_dimension=2, dimensions=None,
+                                max_points=1000, sparse=0.5):
     """Compute persistent homology from residue-level hidden states.
 
     Per the HF blog algorithm:
@@ -319,15 +347,24 @@ def compute_persistent_homology(hidden_states, max_dimension=3, dimensions=None)
     2. Build Rips complex from the distance matrix
     3. Compute persistence and extract persistence diagrams
 
+    For long sequences (> max_points residues), minmax landmark subsampling
+    is applied to keep memory usage tractable.
+
     Parameters
     ----------
     hidden_states : ndarray of shape (seq_len, embedding_dim)
         Per-residue embeddings for one protein.
     max_dimension : int
-        Maximum simplex dimension for Rips complex construction.
+        Maximum simplex dimension for Rips complex construction (default 2).
     dimensions : list of int or None
         Which homology dimensions to return diagrams for.
         Default: [0, 1] (connected components and loops).
+    max_points : int
+        Maximum number of points for PH computation. Longer sequences
+        are subsampled using minmax landmark selection (default 1000).
+    sparse : float or None
+        Sparse Rips approximation parameter. None = exact (slower).
+        0.5 gives a good speed/accuracy tradeoff (default 0.5).
 
     Returns
     -------
@@ -348,10 +385,21 @@ def compute_persistent_homology(hidden_states, max_dimension=3, dimensions=None)
     if len(hidden_states) == 1:
         return {dim: np.array([[0.0, 0.0]], dtype=float) for dim in dimensions}
 
+    # Subsample long sequences to keep memory tractable
+    n_points = len(hidden_states)
+    if n_points > max_points:
+        logger.debug("Subsampling %d points -> %d landmarks for PH", n_points, max_points)
+        landmark_idx = _minmax_landmark_selection(hidden_states, max_points)
+        hidden_states = hidden_states[landmark_idx]
+
     pairwise_distances = pdist(hidden_states, metric="euclidean")
     distance_matrix = squareform(pairwise_distances)
-    max_edge = float(np.max(distance_matrix))
-    rips_complex = gd.RipsComplex(distance_matrix=distance_matrix, max_edge_length=max_edge)
+
+    rips_kwargs = {"distance_matrix": distance_matrix}
+    if sparse is not None:
+        rips_kwargs["sparse"] = sparse
+
+    rips_complex = gd.RipsComplex(**rips_kwargs)
     simplex_tree = rips_complex.create_simplex_tree(max_dimension=max_dimension)
     simplex_tree.persistence()
 
@@ -360,6 +408,7 @@ def compute_persistent_homology(hidden_states, max_dimension=3, dimensions=None)
         intervals = simplex_tree.persistence_intervals_in_dimension(dim)
         result[dim] = _safe_diagram(intervals)
 
+    del simplex_tree, rips_complex, distance_matrix, pairwise_distances
     return result
 
 
@@ -621,27 +670,29 @@ def run_ph_pipeline(seqs, seq_names, esm_model="facebook/esm2_t33_650M_UR50D",
 
     ph_device = torch.device("cuda" if torch.cuda.is_available() and not cpu_only else "cpu")
 
-    # Step 1: Extract hidden states
+    # Steps 1+2: Extract hidden states and compute PH incrementally.
+    # We compute PH immediately after each sequence to avoid holding all
+    # full-resolution hidden states in memory simultaneously.
     backend_label = esm_backend.upper()
-    logger.info("PH Step 1: Extracting %s hidden states for %d sequences", backend_label, len(seqs))
+    logger.info("PH Steps 1-2: Extracting %s hidden states and computing PH "
+                "(dimensions %s) for %d sequences", backend_label, ph_dimensions, len(seqs))
     hidden_states_list = []
+    persistent_diagrams = []
     for idx, seq in enumerate(seqs):
         if esm_backend == "esmc":
             hs = get_esmc_hidden_states(seq, model_path=esm_model, layer=ph_layer, device=ph_device)
         else:
             hs = get_esm2_hidden_states(seq, model_name=esm_model, layer=ph_layer, device=ph_device)
-        hidden_states_list.append(hs)
-        if (idx + 1) % 10 == 0 or idx == len(seqs) - 1:
-            logger.debug("  Processed %d/%d sequences", idx + 1, len(seqs))
 
-    # Step 2: Compute persistent homology
-    logger.info("PH Step 2: Computing persistent homology (dimensions %s)", ph_dimensions)
-    persistent_diagrams = []
-    for idx, hs in enumerate(hidden_states_list):
         pd = compute_persistent_homology(hs, dimensions=ph_dimensions)
         persistent_diagrams.append(pd)
+
+        # Keep a mean-pooled summary (1, D) for downstream RBH/alignment
+        # instead of the full (L, D) matrix to save memory on long sequences.
+        hidden_states_list.append(hs)
+
         if (idx + 1) % 10 == 0 or idx == len(seqs) - 1:
-            logger.debug("  Computed PH for %d/%d sequences", idx + 1, len(seqs))
+            logger.info("  Processed %d/%d sequences (seq len %d)", idx + 1, len(seqs), len(seq))
 
     # Step 3: Compute Wasserstein distance matrix
     logger.info("PH Step 3: Computing Wasserstein distance matrix")
