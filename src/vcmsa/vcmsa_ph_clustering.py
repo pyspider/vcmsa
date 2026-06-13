@@ -83,6 +83,20 @@ def _get_esmc_tokenizer():
             for (klass, attr_name), orig_desc in patches.items():
                 setattr(klass, attr_name, orig_desc)
 
+        # The esm package's _get_token() calls self.__getattr__(name) directly,
+        # which requires __getattr__ to be defined as a method. In transformers
+        # 4.44 it may not exist. Add a fallback that reads the backing attrs.
+        if not hasattr(tokenizer, "__getattr__"):
+            def _fallback_getattr(self, name):
+                backing = "_" + name
+                try:
+                    return object.__getattribute__(self, backing)
+                except AttributeError:
+                    raise AttributeError(
+                        "'{}' object has no attribute '{}'".format(type(self).__name__, name)
+                    )
+            EsmSequenceTokenizer.__getattr__ = _fallback_getattr
+
         return tokenizer
 
 
