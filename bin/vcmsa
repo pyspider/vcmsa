@@ -104,6 +104,13 @@ def get_align_args():
                              "If set, embeddings are cached on disk and reused across runs. "
                              "Decouples model inference from PH computation to reduce peak memory.")
 
+    parser.add_argument("--pca_dim", dest="pca_dim", type=int, default=0,
+                        help="PCA dimensionality reduction before KNN search (e.g. 64). "
+                             "0 = disabled (default). Reduces 1152D embeddings to speed up FAISS.")
+    parser.add_argument("--use_ivf", dest="use_ivf", action="store_true",
+                        help="Use FAISS IVFFlat index for approximate KNN (faster for large datasets). "
+                             "Auto-enabled when >10000 residue vectors regardless of this flag.")
+
     parser.add_argument("-co", "--cpu_only", dest = "cpu_only",  action = "store_true",
                         help="If --cpu_only flag is included, will run on cpu even if gpu available")
 
@@ -375,10 +382,14 @@ def get_seq_groups(seqs, seq_names, embedding_dict, exclude, do_clustering, outf
 
 
 #@profile
-def do_msa(seqs, seq_names, seqnums, hstates_list,  minscore1 = 0.5, alignment_group = 0, args = None):
+def do_msa(seqs, seq_names, seqnums, hstates_list,  minscore1 = 0.5, alignment_group = 0, args = None, preconcat_hstates=None):
     """
     Required args: record_dir, outfile_name, do_pca, headnorm
     Control for running whole alignment process
+
+    If preconcat_hstates is provided (list of unpadded per-sequence arrays),
+    skip the pad→flatten→unpad cycle and directly concatenate them.
+    Also applies PCA dimensionality reduction and IVFFlat for faster KNN.
     """
     fasta_path = args.fasta_path
     # outfile_path =  os.path.dirname(outfile)     
@@ -397,8 +408,6 @@ def do_msa(seqs, seq_names, seqnums, hstates_list,  minscore1 = 0.5, alignment_g
  
     cpu_only = args.cpu_only 
     numseqs = len(seqs)
-    padded_seqlen = hstates_list.shape[1]
-    embedding_length = hstates_list.shape[2]
 
     rbh_outfile = args.rbh_outfile
     mis = args.mis
@@ -407,16 +416,43 @@ def do_msa(seqs, seq_names, seqnums, hstates_list,  minscore1 = 0.5, alignment_g
     rbh_only = args.rbh_only
     bhf = args.bhf
 
-    logging.debug("Flattening hidden states list")
-    hidden_states = np.array(reshape_flat(hstates_list), dtype="float32")
-    logging.debug("embedding_shape: {}".format(hidden_states.shape))
-
-
-    
-    logging.debug("Convert index position to amino acid position")
-
     seqs_aas, seq_to_length = get_seqs_aas(seqs, seqnums)
-    index_to_aa, hidden_states, seqnum_to_index, batch_list = remove_maxlen_padding(hidden_states, seqs_aas, padded_seqlen)
+
+    if preconcat_hstates is not None:
+        # ── Optimized path: skip pad→flatten→unpad ──
+        logging.info("Using optimized pre-concatenated embeddings (no padding)")
+        hidden_states_parts = []
+        index_to_aa = {}
+        batch_list = []
+        seqnum_to_index = {}
+        count_index = 0
+        for i in range(len(seqs_aas)):
+            hs_i = preconcat_hstates[i]
+            seqnum_to_index[i] = []
+            for j in range(len(seqs_aas[i])):
+                batch_list.append(i)
+                aa = seqs_aas[i][j]
+                aa.index = count_index
+                aa.seqindex = i
+                seqnum_to_index[i].append(count_index)
+                index_to_aa[count_index] = aa
+                count_index += 1
+            hidden_states_parts.append(hs_i.astype(np.float32))
+        hidden_states = np.concatenate(hidden_states_parts, axis=0)
+        del hidden_states_parts
+        logging.info("Concatenated %d residue vectors (no padding waste)", hidden_states.shape[0])
+    else:
+        # ── Original path: pad→flatten→unpad ──
+        padded_seqlen = hstates_list.shape[1]
+        embedding_length = hstates_list.shape[2]
+
+        logging.debug("Flattening hidden states list")
+        hidden_states = np.array(reshape_flat(hstates_list), dtype="float32")
+        logging.debug("embedding_shape: {}".format(hidden_states.shape))
+
+        logging.debug("Convert index position to amino acid position")
+        index_to_aa, hidden_states, seqnum_to_index, batch_list = remove_maxlen_padding(hidden_states, seqs_aas, padded_seqlen)
+
     if pca_plot:
         png_hidden_out = "{}/{}.alignment_group{}.prebatch.png".format(record_dir, outfile_name, alignment_group)
         do_pca_plot(hidden_states, index_to_aa, png_hidden_out, seq_to_length = seq_to_length)
@@ -437,16 +473,40 @@ def do_msa(seqs, seq_names, seqnums, hstates_list,  minscore1 = 0.5, alignment_g
         png_hidden_out = "{}/{}.alignment_group{}.postnorm.png".format(record_dir, outfile_name, alignment_group)
         do_pca_plot(hidden_states, index_to_aa, png_hidden_out, seq_to_length = seq_to_length)
 
+    # ── PCA dimensionality reduction ──
+    pca_dim = getattr(args, 'pca_dim', 0)
+    if pca_dim > 0 and hidden_states.shape[1] > pca_dim:
+        from sklearn.decomposition import PCA
+        logging.info("PCA: reducing %dD -> %dD for KNN search (%d vectors)",
+                     hidden_states.shape[1], pca_dim, hidden_states.shape[0])
+        pca = PCA(n_components=pca_dim)
+        hidden_states = pca.fit_transform(hidden_states).astype(np.float32)
+        hidden_states = np.ascontiguousarray(hidden_states)
+        logging.info("PCA: explained variance ratio sum = %.4f", sum(pca.explained_variance_ratio_))
+
     faiss.normalize_L2(hidden_states)
 
-
-
-    index= build_index_flat(hidden_states, scoretype = "cosinesim", normalize_l2 = False) # Already normalized
+    # ── FAISS index: IVFFlat for large datasets, Flat for small ──
+    n_vectors = hidden_states.shape[0]
+    use_ivf = getattr(args, 'use_ivf', False) or n_vectors > 10000
+    if use_ivf and n_vectors > 256:
+        n_clusters = min(int(np.sqrt(n_vectors)), 256)
+        nprobe = min(n_clusters, 16)
+        d = hidden_states.shape[1]
+        quantizer = faiss.IndexFlatIP(d)
+        index = faiss.IndexIVFFlat(quantizer, d, n_clusters, faiss.METRIC_INNER_PRODUCT)
+        index.nprobe = nprobe
+        logging.info("FAISS: IVFFlat index (n_clusters=%d, nprobe=%d, %d vectors x %dD)",
+                     n_clusters, nprobe, n_vectors, d)
+        index.train(hidden_states)
+        index.add(hidden_states)
+    else:
+        index = build_index_flat(hidden_states, scoretype = "cosinesim", normalize_l2 = False) # Already normalized
 
     res = faiss.StandardGpuResources()  # use a single GPU
    #print("Cuda available?", torch.cuda.is_available())
 
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and not cpu_only:
        index = faiss.index_cpu_to_gpu(res, 0, index)
     else:
        logging.debug("KNN search significantly faster on a GPU")
@@ -955,8 +1015,10 @@ if __name__ == '__main__':
         cluster_seqs_list = ph_result["cluster_seqs_list"]
         cluster_names_list = ph_result["cluster_names_list"]
         cluster_hstates_list = ph_result["cluster_hstates_list"]
+        ph_hidden_states_list = ph_result["hidden_states_list"]  # unpadded per-sequence arrays
         to_exclude = ph_result["to_exclude"]
     else:
+        ph_hidden_states_list = None
         # The first step is to get embeddings
         if embedding_path:
            with open(embedding_path, "rb") as f:
@@ -1039,8 +1101,13 @@ if __name__ == '__main__':
 
 
         else:
+            # Build preconcat_hstates for this cluster if using PH pipeline
+            cluster_preconcat = None
+            if args.use_ph_clustering and ph_hidden_states_list is not None:
+                cluster_preconcat = [ph_hidden_states_list[idx] for idx in group_seqnums]
+
             # Main function
-            alignment, index, hidden_states, index_to_aa = do_msa(group_seqs, group_names, group_seqnums, group_embeddings, minscore1 = minscore1, alignment_group = i, args = args)
+            alignment, index, hidden_states, index_to_aa = do_msa(group_seqs, group_names, group_seqnums, group_embeddings, minscore1 = minscore1, alignment_group = i, args = args, preconcat_hstates=cluster_preconcat)
             alignments.append(alignment)
             index_to_aas_list.append(index_to_aa)
             hidden_states_list.append(hidden_states)
