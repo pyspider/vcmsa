@@ -1,4 +1,5 @@
 import logging
+import re
 import numpy as np
 import torch
 from functools import lru_cache
@@ -703,11 +704,14 @@ def run_ph_pipeline(seqs, seq_names, esm_model="facebook/esm2_t33_650M_UR50D",
     npy_paths = []
     mean_pooled = []
     for idx, (seq, name) in enumerate(zip(seqs, seq_names)):
-        npy_path = Path(embeddings_dir) / "{}.npy".format(idx)
+        # Use sequence name as cache key so embeddings are reusable
+        # across runs with different FASTA files (e.g. 10-seq subset
+        # cache is reused when running 987-seq superset).
+        safe_name = re.sub(r'[^\w\-.]', '_', name)
+        npy_path = Path(embeddings_dir) / "{}.npy".format(safe_name)
 
         if npy_path.exists():
             hs = np.load(str(npy_path))
-            # Validate cache: shape[0] must match sequence length
             if hs.shape[0] != len(seq):
                 logger.warning("  [%d/%d] %s: cached embedding length %d != sequence length %d, regenerating",
                                idx + 1, len(seqs), name, hs.shape[0], len(seq))
