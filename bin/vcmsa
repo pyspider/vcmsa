@@ -82,8 +82,35 @@ def get_align_args():
 
     parser.add_argument('--log', dest = "loglevel",  choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], default='INFO')
 
-    parser.add_argument("-m", "--model", dest = "model_name",  type = str, required = True,
+    parser.add_argument("-m", "--model", dest = "model_name",  type = str, required = False,
                         help="Model name or path to local model")
+    parser.add_argument("--use_ph_clustering", dest="use_ph_clustering", action="store_true",
+                        help="Use persistent homology clustering to replace vcMSA sequence grouping")
+    parser.add_argument("--esm_model", dest="esm_model", type=str, default="facebook/esm2_t33_650M_UR50D",
+                        help="ESM model identifier or local path for PH clustering")
+    parser.add_argument("--esm_backend", dest="esm_backend", type=str, default="esm2",
+                        choices=["esm2", "esmc"],
+                        help="Model backend: 'esm2' (HuggingFace ESM-2) or 'esmc' (EvolutionaryScale ESMC_600M)")
+    parser.add_argument("--ph_eps", dest="ph_eps", type=float, default=0.5,
+                        help="DBSCAN eps for PH clustering, default = 0.5")
+    parser.add_argument("--ph_min_samples", dest="ph_min_samples", type=int, default=2,
+                        help="DBSCAN min_samples for PH clustering, default = 2")
+    parser.add_argument("--ph_layer", dest="ph_layer", type=int, default=-1,
+                        help="ESM hidden-state layer for PH clustering, default = -1 (last layer)")
+    parser.add_argument("--ph_dimensions", dest="ph_dimensions", nargs="+", type=int, default=[0, 1],
+                        help="Homology dimensions for persistent homology, default = 0 1")
+    parser.add_argument("--embeddings_dir", dest="embeddings_dir", type=str, default=None,
+                        help="Directory to save/load per-residue embeddings (.npy). "
+                             "If set, embeddings are cached on disk and reused across runs. "
+                             "Decouples model inference from PH computation to reduce peak memory.")
+
+    parser.add_argument("--pca_dim", dest="pca_dim", type=int, default=0,
+                        help="[Debug] PCA dimensionality reduction before KNN search (e.g. 64). "
+                             "0 = disabled (default, uses full 1152D). "
+                             "Trades alignment accuracy for speed.")
+    parser.add_argument("--use_ivf", dest="use_ivf", action="store_true",
+                        help="Use FAISS IVFFlat index for approximate KNN (faster for large datasets). "
+                             "Auto-enabled when >10000 residue vectors regardless of this flag.")
 
     parser.add_argument("-co", "--cpu_only", dest = "cpu_only",  action = "store_true",
                         help="If --cpu_only flag is included, will run on cpu even if gpu available")
@@ -135,6 +162,8 @@ def get_align_args():
     parser.add_argument("-dc", "--do_clustering", dest = "do_clustering", action='store_true',
                         help="If flagged, does sequence clustering into subgroups")
     args = parser.parse_args()
+    if not args.use_ph_clustering and args.model_name is None:
+        parser.error("argument -m/--model is required unless --use_ph_clustering is set")
 
     return(args)
 
@@ -354,10 +383,14 @@ def get_seq_groups(seqs, seq_names, embedding_dict, exclude, do_clustering, outf
 
 
 #@profile
-def do_msa(seqs, seq_names, seqnums, hstates_list,  minscore1 = 0.5, alignment_group = 0, args = None):
+def do_msa(seqs, seq_names, seqnums, hstates_list,  minscore1 = 0.5, alignment_group = 0, args = None, preconcat_hstates=None):
     """
     Required args: record_dir, outfile_name, do_pca, headnorm
     Control for running whole alignment process
+
+    If preconcat_hstates is provided (list of unpadded per-sequence arrays),
+    skip the pad→flatten→unpad cycle and directly concatenate them.
+    Also applies PCA dimensionality reduction and IVFFlat for faster KNN.
     """
     fasta_path = args.fasta_path
     # outfile_path =  os.path.dirname(outfile)     
@@ -376,8 +409,6 @@ def do_msa(seqs, seq_names, seqnums, hstates_list,  minscore1 = 0.5, alignment_g
  
     cpu_only = args.cpu_only 
     numseqs = len(seqs)
-    padded_seqlen = hstates_list.shape[1]
-    embedding_length = hstates_list.shape[2]
 
     rbh_outfile = args.rbh_outfile
     mis = args.mis
@@ -386,16 +417,49 @@ def do_msa(seqs, seq_names, seqnums, hstates_list,  minscore1 = 0.5, alignment_g
     rbh_only = args.rbh_only
     bhf = args.bhf
 
-    logging.debug("Flattening hidden states list")
-    hidden_states = np.array(reshape_flat(hstates_list), dtype="float32")
-    logging.debug("embedding_shape: {}".format(hidden_states.shape))
-
-
-    
-    logging.debug("Convert index position to amino acid position")
-
     seqs_aas, seq_to_length = get_seqs_aas(seqs, seqnums)
-    index_to_aa, hidden_states, seqnum_to_index, batch_list = remove_maxlen_padding(hidden_states, seqs_aas, padded_seqlen)
+
+    if preconcat_hstates is not None:
+        # ── Optimized path: skip pad→flatten→unpad ──
+        logging.info("Using optimized pre-concatenated embeddings (no padding)")
+        hidden_states_parts = []
+        index_to_aa = {}
+        batch_list = []
+        seqnum_to_index = {}
+        count_index = 0
+        for i in range(len(seqs_aas)):
+            hs_i = preconcat_hstates[i]
+            if hs_i.shape[0] != len(seqs_aas[i]):
+                raise ValueError(
+                    "Embedding/sequence length mismatch for sequence {}: "
+                    "embedding has {} rows but sequence has {} residues. "
+                    "Try deleting the embeddings cache directory and re-running.".format(
+                        i, hs_i.shape[0], len(seqs_aas[i])))
+            seqnum_to_index[i] = []
+            for j in range(len(seqs_aas[i])):
+                batch_list.append(i)
+                aa = seqs_aas[i][j]
+                aa.index = count_index
+                aa.seqindex = i
+                seqnum_to_index[i].append(count_index)
+                index_to_aa[count_index] = aa
+                count_index += 1
+            hidden_states_parts.append(hs_i.astype(np.float32))
+        hidden_states = np.concatenate(hidden_states_parts, axis=0)
+        del hidden_states_parts
+        logging.info("Concatenated %d residue vectors (no padding waste)", hidden_states.shape[0])
+    else:
+        # ── Original path: pad→flatten→unpad ──
+        padded_seqlen = hstates_list.shape[1]
+        embedding_length = hstates_list.shape[2]
+
+        logging.debug("Flattening hidden states list")
+        hidden_states = np.array(reshape_flat(hstates_list), dtype="float32")
+        logging.debug("embedding_shape: {}".format(hidden_states.shape))
+
+        logging.debug("Convert index position to amino acid position")
+        index_to_aa, hidden_states, seqnum_to_index, batch_list = remove_maxlen_padding(hidden_states, seqs_aas, padded_seqlen)
+
     if pca_plot:
         png_hidden_out = "{}/{}.alignment_group{}.prebatch.png".format(record_dir, outfile_name, alignment_group)
         do_pca_plot(hidden_states, index_to_aa, png_hidden_out, seq_to_length = seq_to_length)
@@ -416,16 +480,40 @@ def do_msa(seqs, seq_names, seqnums, hstates_list,  minscore1 = 0.5, alignment_g
         png_hidden_out = "{}/{}.alignment_group{}.postnorm.png".format(record_dir, outfile_name, alignment_group)
         do_pca_plot(hidden_states, index_to_aa, png_hidden_out, seq_to_length = seq_to_length)
 
+    # ── PCA dimensionality reduction ──
+    pca_dim = getattr(args, 'pca_dim', 0)
+    if pca_dim > 0 and hidden_states.shape[1] > pca_dim:
+        from sklearn.decomposition import PCA
+        logging.info("PCA: reducing %dD -> %dD for KNN search (%d vectors)",
+                     hidden_states.shape[1], pca_dim, hidden_states.shape[0])
+        pca = PCA(n_components=pca_dim)
+        hidden_states = pca.fit_transform(hidden_states).astype(np.float32)
+        hidden_states = np.ascontiguousarray(hidden_states)
+        logging.info("PCA: explained variance ratio sum = %.4f", sum(pca.explained_variance_ratio_))
+
     faiss.normalize_L2(hidden_states)
 
-
-
-    index= build_index_flat(hidden_states, scoretype = "cosinesim", normalize_l2 = False) # Already normalized
+    # ── FAISS index: IVFFlat only with --use_ivf, Flat by default ──
+    n_vectors = hidden_states.shape[0]
+    use_ivf = getattr(args, 'use_ivf', False)
+    if use_ivf and n_vectors > 256:
+        n_clusters = min(int(np.sqrt(n_vectors)), 256)
+        nprobe = min(n_clusters, 16)
+        d = hidden_states.shape[1]
+        quantizer = faiss.IndexFlatIP(d)
+        index = faiss.IndexIVFFlat(quantizer, d, n_clusters, faiss.METRIC_INNER_PRODUCT)
+        index.nprobe = nprobe
+        logging.info("FAISS: IVFFlat index (n_clusters=%d, nprobe=%d, %d vectors x %dD)",
+                     n_clusters, nprobe, n_vectors, d)
+        index.train(hidden_states)
+        index.add(hidden_states)
+    else:
+        index = build_index_flat(hidden_states, scoretype = "cosinesim", normalize_l2 = False) # Already normalized
 
     res = faiss.StandardGpuResources()  # use a single GPU
    #print("Cuda available?", torch.cuda.is_available())
 
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and not cpu_only:
        index = faiss.index_cpu_to_gpu(res, 0, index)
     else:
        logging.debug("KNN search significantly faster on a GPU")
@@ -708,7 +796,7 @@ def do_msa(seqs, seq_names, seqnums, hstates_list,  minscore1 = 0.5, alignment_g
             logging.debug("Alignment complete after gapfilling attempt {}".format(gapfilling_attempt - 1))
      
             alignment = make_alignment(cluster_order, seqnums, clustid_to_clust, seq_names)
-            return(alignment, index, hidden_states, index_to_aa)
+            return(alignment, index, hidden_states, index_to_aa, None)
 
         if ( gapfilling_attempt == max_iterations or unassigned == history_unassigned['threebefore'] or  unassigned == history_unassigned['twobefore'] ) and gapfilling_attempt > 10:
             if minscore > 0.1 and gapfilling_attempt != max_iterations:
@@ -724,13 +812,18 @@ def do_msa(seqs, seq_names, seqnums, hstates_list,  minscore1 = 0.5, alignment_g
                     alignment = most_complete_alignment
                 else:
                     logging.debug("Currently alignment is the most complete so far")
-                logging.debug("Placing remaining amino acids")
-                cluster_order, clustid_to_clust, pos_to_clustid, alignment = fill_in_hopeless(unassigned, seqs_aas, cluster_order, clustid_to_clust, pos_to_clustid, index, hidden_states, gapfilling_attempt, args = args)
-                unassigned = get_unassigned_aas(seqs_aas, pos_to_clustid)
-                #ic('This unassigned should be empty', unassigned)
-                alignment = make_alignment(cluster_order, seqnums, clustid_to_clust, seq_names)
-
-                return(alignment,   index, hidden_states, index_to_aa)
+                # Defer fill_in_hopeless to after squish for performance:
+                # fill_in_hopeless creates thousands of singleton clusters which
+                # make squish_clusters extremely slow (O(n_singletons * FAISS_search)).
+                # By running squish first on the clean alignment (~hundreds of clusters),
+                # then filling in hopeless residues afterwards, we avoid the bottleneck.
+                logging.info("Deferring fill_in_hopeless (%d gaps) to after squish", len(unassigned))
+                hopeless_data = {
+                    'unassigned': unassigned,
+                    'seqs_aas': seqs_aas,
+                    'gapfilling_attempt': gapfilling_attempt,
+                }
+                return(alignment, index, hidden_states, index_to_aa, hopeless_data)
  
         history_unassigned['threebefore'] = history_unassigned['twobefore']
         history_unassigned['twobefore'] = history_unassigned['onebefore']
@@ -802,7 +895,7 @@ def do_msa(seqs, seq_names, seqnums, hstates_list,  minscore1 = 0.5, alignment_g
 
            
             #ic(alignment_ic(alignment, seq_names)[0])
-    return( alignment,  index, hidden_states,  index_to_aa)   
+    return( alignment,  index, hidden_states,  index_to_aa, None)   
 
 
 #@profile
@@ -840,6 +933,12 @@ if __name__ == '__main__':
     headnorm = args.headnorm
     padding =args.padding
     seqsim_thresh  = args.seqsimthresh 
+    use_ph_clustering = args.use_ph_clustering
+    esm_model = args.esm_model
+    esm_backend = args.esm_backend
+    ph_eps = args.ph_eps
+    ph_min_samples = args.ph_min_samples
+    ph_layer = args.ph_layer
     do_clustering = args.do_clustering
     do_clustering = True
 
@@ -895,6 +994,7 @@ if __name__ == '__main__':
     minscore1 = 0.5
 
     logging.debug("model: {}".format(model_name))
+    logging.debug("use_ph_clustering: {}".format(use_ph_clustering))
     logging.debug("fasta: {}".format(fasta_path))
     logging.debug("padding: {}".format(padding))
     logging.debug("first score thresholds: {}".format(minscore1))
@@ -908,44 +1008,67 @@ if __name__ == '__main__':
 
  
 
-    # The first step is to get embeddings
-    if embedding_path:
-       with open(embedding_path, "rb") as f:
-             embedding_dict = pickle.load(f)
+    if use_ph_clustering:
+        from vcmsa.vcmsa_ph_clustering import run_ph_pipeline
 
+        ph_dimensions = args.ph_dimensions
+        ph_result = run_ph_pipeline(
+            seqs, seq_names,
+            esm_model=esm_model,
+            ph_layer=ph_layer,
+            ph_eps=ph_eps,
+            ph_min_samples=ph_min_samples,
+            ph_dimensions=ph_dimensions,
+            cpu_only=cpu_only,
+            esm_backend=esm_backend,
+            embeddings_dir=args.embeddings_dir,
+        )
+        cluster_seqnums_list = ph_result["cluster_seqnums_list"]
+        cluster_seqs_list = ph_result["cluster_seqs_list"]
+        cluster_names_list = ph_result["cluster_names_list"]
+        cluster_hstates_list = ph_result["cluster_hstates_list"]
+        ph_hidden_states_list = ph_result["hidden_states_list"]  # unpadded per-sequence arrays
+        to_exclude = ph_result["to_exclude"]
     else:
-        seqlens = [len(x) for x in seqs]
-       #print("printing model_name:")
-       #print(model_name)
-       #print("printing seq_lens")
-       #print(seqlens)
-       #print("printing layers")
-       #print(layers)
-       #print("printing padding")
-       #print(padding)
-        #print("printing headnames")
-        #print(headnames)
-        embedding_dict = get_embeddings(seqs_spaced,
-                                    model_name,
-                                    seqlens = seqlens,
-                                    get_sequence_embeddings = True,
-                                    get_aa_embeddings = True,
-                                    layers = layers,  
-                                    padding = padding,
-                                    heads = headnames,
-                                    cpu_only = cpu_only, 
-                                    half = False)
-        if emb_outfile:
-           with open(emb_outfile, "wb") as fOut:
-               pickle.dump(embedding_dict, fOut, protocol=pickle.HIGHEST_PROTOCOL)
+        ph_hidden_states_list = None
+        # The first step is to get embeddings
+        if embedding_path:
+           with open(embedding_path, "rb") as f:
+                 embedding_dict = pickle.load(f)
 
-        if embed_only:
-            #print("Quiting after saving embedding at {}".format(emb_outfile))
-            exit(0)
+        else:
+            seqlens = [len(x) for x in seqs]
+           #print("printing model_name:")
+           #print(model_name)
+           #print("printing seq_lens")
+           #print(seqlens)
+           #print("printing layers")
+           #print(layers)
+           #print("printing padding")
+           #print(padding)
+            #print("printing headnames")
+            #print(headnames)
+            embedding_dict = get_embeddings(seqs_spaced,
+                                        model_name,
+                                        seqlens = seqlens,
+                                        get_sequence_embeddings = True,
+                                        get_aa_embeddings = True,
+                                        layers = layers,  
+                                        padding = padding,
+                                        heads = headnames,
+                                        cpu_only = cpu_only, 
+                                        half = False)
+            if emb_outfile:
+               with open(emb_outfile, "wb") as fOut:
+                   pickle.dump(embedding_dict, fOut, protocol=pickle.HIGHEST_PROTOCOL)
 
-    # The sequences are divided into groups
-    #ic(seqsim_thresh)
-    cluster_seqnums_list, cluster_seqs_list,  cluster_names_list, cluster_hstates_list, to_exclude = get_seq_groups(seqs ,seq_names, embedding_dict,  exclude, do_clustering, outfile_name, record_dir, seqsim_thresh = seqsim_thresh, pca_plot = pca_plot )
+            if embed_only:
+                #print("Quiting after saving embedding at {}".format(emb_outfile))
+                exit(0)
+
+        # The sequences are divided into groups
+        #ic(seqsim_thresh)
+        cluster_seqnums_list, cluster_seqs_list,  cluster_names_list, cluster_hstates_list, to_exclude = get_seq_groups(seqs ,seq_names, embedding_dict,  exclude, do_clustering, outfile_name, record_dir, seqsim_thresh = seqsim_thresh, pca_plot = pca_plot )
 
     aln_fasta_list = []
     excluded_records = []
@@ -990,16 +1113,26 @@ if __name__ == '__main__':
 
 
         else:
+            # Build preconcat_hstates for this cluster if using PH pipeline
+            cluster_preconcat = None
+            if args.use_ph_clustering and ph_hidden_states_list is not None:
+                cluster_preconcat = [ph_hidden_states_list[idx] for idx in group_seqnums]
+
             # Main function
-            alignment, index, hidden_states, index_to_aa = do_msa(group_seqs, group_names, group_seqnums, group_embeddings, minscore1 = minscore1, alignment_group = i, args = args)
+            alignment, index, hidden_states, index_to_aa, hopeless_data = do_msa(group_seqs, group_names, group_seqnums, group_embeddings, minscore1 = minscore1, alignment_group = i, args = args, preconcat_hstates=cluster_preconcat)
             alignments.append(alignment)
             index_to_aas_list.append(index_to_aa)
             hidden_states_list.append(hidden_states)
     
+            # Squish BEFORE fill_in_hopeless: squish on clean alignment
+            # (~hundreds of meaningful clusters) is fast. Squishing after
+            # fill_in_hopeless (~thousands of singleton clusters) is the
+            # bottleneck that causes 10+ minute hangs.
             cluster_order, clustid_to_clust = clusts_from_alignment(alignment)
             squish = True
             if squish == True: 
-                logging.debug("attempt squish, merging adjacent non-overlapping clusters")       
+                logging.info("attempt squish on %d clusters (before hopeless insertion)",
+                             len(cluster_order))
                 for rep in range(0,20):
                      prevclust = alignment
                      cluster_order, clustid_to_clust = squish_clusters(alignment, index, hidden_states, index_to_aa)                
@@ -1007,6 +1140,26 @@ if __name__ == '__main__':
                      if alignment.alignment == prevclust:
                             break
             alignment = make_alignment(cluster_order, group_seqnums, clustid_to_clust, group_names)
+
+            # Now fill in hopeless residues (deferred from do_msa Final Stage)
+            if hopeless_data is not None:
+                logging.info("Placing remaining amino acids after squish (%d gaps)",
+                             len(hopeless_data['unassigned']))
+                cluster_order, clustid_to_clust = clusts_from_alignment(alignment)
+                # Reconstruct pos_to_clustid from the squished alignment
+                pos_to_clustid = {}
+                for cid, clust in clustid_to_clust.items():
+                    for aa in clust:
+                        pos_to_clustid[aa] = cid
+                cluster_order, clustid_to_clust, pos_to_clustid, alignment = fill_in_hopeless(
+                    hopeless_data['unassigned'],
+                    hopeless_data['seqs_aas'],
+                    cluster_order, clustid_to_clust, pos_to_clustid,
+                    index, hidden_states,
+                    hopeless_data['gapfilling_attempt'],
+                    args=args)
+                alignment = make_alignment(cluster_order, group_seqnums, clustid_to_clust, group_names)
+                logging.info("Hopeless insertion complete, alignment width: %d", alignment.width)
              
             
             if pca_plot: 

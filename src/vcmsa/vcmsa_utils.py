@@ -4348,8 +4348,13 @@ def  do_pca_plot(hidden_states, index_to_aa, outfile, clustid_to_clust = None, s
             for key in seqnums:
                 seqnum_to_color[key] = (random.random(), random.random(),random.random())
 
-        indexes = list(index_to_aa.keys())
-        hidden_states_aas = hidden_states[indexes, :]
+        # Filter indexes to only include AAs that are in clusters (when plotting clusters)
+        all_indexes = list(index_to_aa.keys())
+        if clustid_to_clust:
+            valid_indexes = [i for i in all_indexes if index_to_aa[i] in aa_to_clustid]
+        else:
+            valid_indexes = all_indexes
+        hidden_states_aas = hidden_states[valid_indexes, :]
 
         d1 = hidden_states.shape[1]
         target = 128
@@ -4372,24 +4377,20 @@ def  do_pca_plot(hidden_states, index_to_aa, outfile, clustid_to_clust = None, s
         aalist = []
         seqlist = []
         poslist = []
-        for i in range(len(hidden_states)):
-            if i in index_to_aa.keys():
+        for i in valid_indexes:
               aa = index_to_aa[i]
-              aalist.append(aa.seqaa)
-              seqlist.append(aa.seqnum)
-              poslist.append(aa.seqpos)
 
               if clustid_to_clust:
                   clustid = aa_to_clustid[aa]
-                  #ic(clustid)
-
-
                   color = clustid_to_color[clustid]
                   labellist.append(clustid)
               else:
                   color = seqnum_to_color[aa.seqnum]
                   labellist.append(aa.seqnum)
 
+              aalist.append(aa.seqaa)
+              seqlist.append(aa.seqnum)
+              poslist.append(aa.seqpos)
               colorlist.append(color)
         label_arr = np.array(labellist)
         color_arr = np.array(colorlist)
@@ -4407,7 +4408,9 @@ def  do_pca_plot(hidden_states, index_to_aa, outfile, clustid_to_clust = None, s
             if seq_to_length:
                 for iclust in seq_to_length.keys():
                    plt.scatter(reduced[:,dim1-1][label_arr == iclust], reduced[:,dim2-1][label_arr == iclust], c = color_arr[label_arr == iclust], alpha = 0.8, label = iclust)
-            plt.legend()
+            n_labels = len(set(labellist))
+            if n_labels <= 50:
+                plt.legend(loc='upper right')
             plt.xlabel('component {}'.format(dim1))
             plt.ylabel('component {}'.format(dim2))
 
