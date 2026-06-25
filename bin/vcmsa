@@ -487,9 +487,9 @@ def do_msa(seqs, seq_names, seqnums, hstates_list,  minscore1 = 0.5, alignment_g
 
     faiss.normalize_L2(hidden_states)
 
-    # ── FAISS index: IVFFlat for large datasets, Flat for small ──
+    # ── FAISS index: IVFFlat only with --use_ivf, Flat by default ──
     n_vectors = hidden_states.shape[0]
-    use_ivf = getattr(args, 'use_ivf', False) or n_vectors > 10000
+    use_ivf = getattr(args, 'use_ivf', False)
     if use_ivf and n_vectors > 256:
         n_clusters = min(int(np.sqrt(n_vectors)), 256)
         nprobe = min(n_clusters, 16)
