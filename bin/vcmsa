@@ -105,8 +105,9 @@ def get_align_args():
                              "Decouples model inference from PH computation to reduce peak memory.")
 
     parser.add_argument("--pca_dim", dest="pca_dim", type=int, default=0,
-                        help="PCA dimensionality reduction before KNN search (e.g. 64). "
-                             "0 = disabled (default). Reduces 1152D embeddings to speed up FAISS.")
+                        help="[Debug] PCA dimensionality reduction before KNN search (e.g. 64). "
+                             "0 = disabled (default, uses full 1152D). "
+                             "Trades alignment accuracy for speed.")
     parser.add_argument("--use_ivf", dest="use_ivf", action="store_true",
                         help="Use FAISS IVFFlat index for approximate KNN (faster for large datasets). "
                              "Auto-enabled when >10000 residue vectors regardless of this flag.")
@@ -789,7 +790,7 @@ def do_msa(seqs, seq_names, seqnums, hstates_list,  minscore1 = 0.5, alignment_g
             logging.debug("Alignment complete after gapfilling attempt {}".format(gapfilling_attempt - 1))
      
             alignment = make_alignment(cluster_order, seqnums, clustid_to_clust, seq_names)
-            return(alignment, index, hidden_states, index_to_aa)
+            return(alignment, index, hidden_states, index_to_aa, None)
 
         if ( gapfilling_attempt == max_iterations or unassigned == history_unassigned['threebefore'] or  unassigned == history_unassigned['twobefore'] ) and gapfilling_attempt > 10:
             if minscore > 0.1 and gapfilling_attempt != max_iterations:
@@ -805,13 +806,18 @@ def do_msa(seqs, seq_names, seqnums, hstates_list,  minscore1 = 0.5, alignment_g
                     alignment = most_complete_alignment
                 else:
                     logging.debug("Currently alignment is the most complete so far")
-                logging.debug("Placing remaining amino acids")
-                cluster_order, clustid_to_clust, pos_to_clustid, alignment = fill_in_hopeless(unassigned, seqs_aas, cluster_order, clustid_to_clust, pos_to_clustid, index, hidden_states, gapfilling_attempt, args = args)
-                unassigned = get_unassigned_aas(seqs_aas, pos_to_clustid)
-                #ic('This unassigned should be empty', unassigned)
-                alignment = make_alignment(cluster_order, seqnums, clustid_to_clust, seq_names)
-
-                return(alignment,   index, hidden_states, index_to_aa)
+                # Defer fill_in_hopeless to after squish for performance:
+                # fill_in_hopeless creates thousands of singleton clusters which
+                # make squish_clusters extremely slow (O(n_singletons * FAISS_search)).
+                # By running squish first on the clean alignment (~hundreds of clusters),
+                # then filling in hopeless residues afterwards, we avoid the bottleneck.
+                logging.info("Deferring fill_in_hopeless (%d gaps) to after squish", len(unassigned))
+                hopeless_data = {
+                    'unassigned': unassigned,
+                    'seqs_aas': seqs_aas,
+                    'gapfilling_attempt': gapfilling_attempt,
+                }
+                return(alignment, index, hidden_states, index_to_aa, hopeless_data)
  
         history_unassigned['threebefore'] = history_unassigned['twobefore']
         history_unassigned['twobefore'] = history_unassigned['onebefore']
@@ -883,7 +889,7 @@ def do_msa(seqs, seq_names, seqnums, hstates_list,  minscore1 = 0.5, alignment_g
 
            
             #ic(alignment_ic(alignment, seq_names)[0])
-    return( alignment,  index, hidden_states,  index_to_aa)   
+    return( alignment,  index, hidden_states,  index_to_aa, None)   
 
 
 #@profile
@@ -1107,15 +1113,20 @@ if __name__ == '__main__':
                 cluster_preconcat = [ph_hidden_states_list[idx] for idx in group_seqnums]
 
             # Main function
-            alignment, index, hidden_states, index_to_aa = do_msa(group_seqs, group_names, group_seqnums, group_embeddings, minscore1 = minscore1, alignment_group = i, args = args, preconcat_hstates=cluster_preconcat)
+            alignment, index, hidden_states, index_to_aa, hopeless_data = do_msa(group_seqs, group_names, group_seqnums, group_embeddings, minscore1 = minscore1, alignment_group = i, args = args, preconcat_hstates=cluster_preconcat)
             alignments.append(alignment)
             index_to_aas_list.append(index_to_aa)
             hidden_states_list.append(hidden_states)
     
+            # Squish BEFORE fill_in_hopeless: squish on clean alignment
+            # (~hundreds of meaningful clusters) is fast. Squishing after
+            # fill_in_hopeless (~thousands of singleton clusters) is the
+            # bottleneck that causes 10+ minute hangs.
             cluster_order, clustid_to_clust = clusts_from_alignment(alignment)
             squish = True
             if squish == True: 
-                logging.debug("attempt squish, merging adjacent non-overlapping clusters")       
+                logging.info("attempt squish on %d clusters (before hopeless insertion)",
+                             len(cluster_order))
                 for rep in range(0,20):
                      prevclust = alignment
                      cluster_order, clustid_to_clust = squish_clusters(alignment, index, hidden_states, index_to_aa)                
@@ -1123,6 +1134,26 @@ if __name__ == '__main__':
                      if alignment.alignment == prevclust:
                             break
             alignment = make_alignment(cluster_order, group_seqnums, clustid_to_clust, group_names)
+
+            # Now fill in hopeless residues (deferred from do_msa Final Stage)
+            if hopeless_data is not None:
+                logging.info("Placing remaining amino acids after squish (%d gaps)",
+                             len(hopeless_data['unassigned']))
+                cluster_order, clustid_to_clust = clusts_from_alignment(alignment)
+                # Reconstruct pos_to_clustid from the squished alignment
+                pos_to_clustid = {}
+                for cid, clust in clustid_to_clust.items():
+                    for aa in clust:
+                        pos_to_clustid[aa] = cid
+                cluster_order, clustid_to_clust, pos_to_clustid, alignment = fill_in_hopeless(
+                    hopeless_data['unassigned'],
+                    hopeless_data['seqs_aas'],
+                    cluster_order, clustid_to_clust, pos_to_clustid,
+                    index, hidden_states,
+                    hopeless_data['gapfilling_attempt'],
+                    args=args)
+                alignment = make_alignment(cluster_order, group_seqnums, clustid_to_clust, group_names)
+                logging.info("Hopeless insertion complete, alignment width: %d", alignment.width)
              
             
             if pca_plot: 
