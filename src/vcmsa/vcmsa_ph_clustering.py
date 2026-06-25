@@ -707,7 +707,19 @@ def run_ph_pipeline(seqs, seq_names, esm_model="facebook/esm2_t33_650M_UR50D",
 
         if npy_path.exists():
             hs = np.load(str(npy_path))
-            logger.debug("  [%d/%d] %s: using cached embedding", idx + 1, len(seqs), name)
+            # Validate cache: shape[0] must match sequence length
+            if hs.shape[0] != len(seq):
+                logger.warning("  [%d/%d] %s: cached embedding length %d != sequence length %d, regenerating",
+                               idx + 1, len(seqs), name, hs.shape[0], len(seq))
+                if esm_backend == "esmc":
+                    hs = get_esmc_hidden_states(seq, model_path=esm_model,
+                                                layer=ph_layer, device=ph_device)
+                else:
+                    hs = get_esm2_hidden_states(seq, model_name=esm_model,
+                                                layer=ph_layer, device=ph_device)
+                np.save(str(npy_path), hs)
+            else:
+                logger.debug("  [%d/%d] %s: using cached embedding", idx + 1, len(seqs), name)
         else:
             if esm_backend == "esmc":
                 hs = get_esmc_hidden_states(seq, model_path=esm_model,

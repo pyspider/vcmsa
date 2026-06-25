@@ -4408,7 +4408,9 @@ def  do_pca_plot(hidden_states, index_to_aa, outfile, clustid_to_clust = None, s
             if seq_to_length:
                 for iclust in seq_to_length.keys():
                    plt.scatter(reduced[:,dim1-1][label_arr == iclust], reduced[:,dim2-1][label_arr == iclust], c = color_arr[label_arr == iclust], alpha = 0.8, label = iclust)
-            plt.legend()
+            n_labels = len(set(labellist))
+            if n_labels <= 50:
+                plt.legend(loc='upper right')
             plt.xlabel('component {}'.format(dim1))
             plt.ylabel('component {}'.format(dim2))
 

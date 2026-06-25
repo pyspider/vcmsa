@@ -429,6 +429,12 @@ def do_msa(seqs, seq_names, seqnums, hstates_list,  minscore1 = 0.5, alignment_g
         count_index = 0
         for i in range(len(seqs_aas)):
             hs_i = preconcat_hstates[i]
+            if hs_i.shape[0] != len(seqs_aas[i]):
+                raise ValueError(
+                    "Embedding/sequence length mismatch for sequence {}: "
+                    "embedding has {} rows but sequence has {} residues. "
+                    "Try deleting the embeddings cache directory and re-running.".format(
+                        i, hs_i.shape[0], len(seqs_aas[i])))
             seqnum_to_index[i] = []
             for j in range(len(seqs_aas[i])):
                 batch_list.append(i)
